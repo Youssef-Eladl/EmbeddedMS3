@@ -1,0 +1,15 @@
+# Python Requirements for Forge Registry Station - Aruco Tracking System
+# Install with: pip install -r requirements.txt
+
+# OpenCV with Aruco module - Computer Vision Library
+# Used for: Camera capture, Aruco marker detection, image processing, drawing
+# IMPORTANT: Use opencv-contrib-python for Aruco support
+opencv-contrib-python>=4.8.0
+
+# NumPy - Numerical Computing
+# Used for: Array operations, coordinate transformations, mathematical computations
+numpy>=1.24.0
+
+# PySerial - Serial Communication (optional, for legacy serial_tracker.py)
+# Not needed for WiFi version (aruco_wifi_tracker.py)
+pyserial>=3.5
