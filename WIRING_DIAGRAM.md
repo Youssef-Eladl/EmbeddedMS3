@@ -355,3 +355,246 @@ Logic:
 ---
 
 **Note**: Always double-check connections before applying power. Start with low voltage testing when possible.
+
+
+old:
+
+# RP2040 Gantry System - Wiring Guide
+
+Complete wiring documentation for the button-controlled dual-motor gantry system.
+
+---
+
+## 📌 Pin Summary
+
+| Component | Pin | GPIO | Physical Pin | Notes |
+|-----------|-----|------|--------------|-------|
+| **I2C LCD** |
+| SDA | GPIO 0 | Pin 1 | I2C Data |
+| SCL | GPIO 1 | Pin 2 | I2C Clock |
+| **Motor A (Right Motor)** |
+| Enable A (PWM) | GPIO 15 | Pin 20 | H-Bridge ENA |
+| Input 1 | GPIO 17 | Pin 22 | Direction Control |
+| Input 2 | GPIO 16 | Pin 21 | Direction Control |
+| **Motor B (Left Motor)** |
+| Enable B (PWM) | GPIO 13 | Pin 17 | H-Bridge ENB |
+
+| Input 3 | GPIO 19 | Pin 25 | Direction Control |
+| Input 4 | GPIO 18 | Pin 24 | Direction Control |
+| **Control Buttons** |
+| Forward | GPIO 6 | Pin 9 | Y+ Movement |
+| Right | GPIO 7 | Pin 10 | X+ Movement |
+| Left | GPIO 8 | Pin 11 | X- Movement |
+| Back | GPIO 9 | Pin 12 | Y- Movement |
+
+---
+
+## 🔌 Detailed Wiring
+
+### I2C LCD Display (16x2 with PCF8574 Backpack)
+
+```
+LCD Module → RP2040 Pico
+─────────────────────────
+VCC        → 3.3V or 5V (check your module)
+GND        → GND
+SDA        → GPIO 0 (Pin 1)
+SCL        → GPIO 1 (Pin 2)
+
+I2C Address: 0x27
+I2C Speed: 100kHz
+```
+
+**Note:** GPIO 0 and 1 have internal pull-up resistors enabled in code.
+
+---
+
+### Motor A - Right Motor (H-Bridge Channel A)
+
+```
+H-Bridge → RP2040 Pico
+──────────────────────
+ENA (Enable A) → GPIO 15 (Pin 20) - PWM Signal
+IN1            → GPIO 17 (Pin 22) - Direction
+IN2            → GPIO 16 (Pin 21) - Direction
+
+Motor Wiring:
+OUT1 → Motor A Terminal 1
+OUT2 → Motor A Terminal 2
+```
+
+**Direction Control:**
+- Forward: IN1=HIGH, IN2=LOW
+- Backward: IN1=LOW, IN2=HIGH
+- Stop: IN1=LOW, IN2=LOW, PWM=0
+
+---
+
+### Motor B - Left Motor (H-Bridge Channel B)
+
+```
+H-Bridge → RP2040 Pico
+──────────────────────
+ENB (Enable B) → GPIO 13 (Pin 17) - PWM Signal
+IN3            → GPIO 19 (Pin 25) - Direction
+IN4            → GPIO 18 (Pin 24) - Direction
+
+Motor Wiring:
+OUT3 → Motor B Terminal 1
+OUT4 → Motor B Terminal 2
+```
+
+**Direction Control:**
+- Forward: IN3=HIGH, IN4=LOW
+- Backward: IN3=LOW, IN4=HIGH
+- Stop: IN3=LOW, IN4=LOW, PWM=0
+
+---
+
+### Control Buttons
+
+All buttons use **pull-down resistors** configured in software.
+
+```
+Button Wiring (Active HIGH):
+────────────────────────────
+
+Forward Button:
+  One terminal → GPIO 6 (Pin 9)
+  Other terminal → 3.3V
+
+Right Button:
+  One terminal → GPIO 7 (Pin 10)
+  Other terminal → 3.3V
+
+Left Button:
+  One terminal → GPIO 8 (Pin 11)
+  Other terminal → 3.3V
+
+Back Button:
+  One terminal → GPIO 9 (Pin 12)
+  Other terminal → 3.3V
+```
+
+**Button Logic:**
+- Unpressed: GPIO reads LOW (0) - pull-down to GND
+- Pressed: GPIO reads HIGH (1) - connected to 3.3V
+
+---
+
+## 🎮 Movement Control
+
+| Button | X-Axis | Y-Axis | Motor A | Motor B |
+|--------|--------|--------|---------|---------|
+| **Forward** | - | + | Forward | Backward |
+| **Back** | - | - | Backward | Forward |
+| **Right** | + | - | Forward | Forward |
+| **Left** | - | - | Backward | Backward |
+
+**Speed:** All movements run at PWM level 10000 (~15% of maximum)
+
+---
+
+## ⚡ Power Requirements
+
+### RP2040 Pico
+- **Input:** 5V via USB or VSYS
+- **Logic Level:** 3.3V
+
+### H-Bridge Motor Driver (L298N or similar)
+- **Motor Power (VCC):** 12V DC (for 12V motors)
+- **Logic Power (5V):** Can be powered from Pico's VBUS or separate 5V supply
+- **GND:** Common ground with Pico **CRITICAL**
+
+### Motors
+- **Type:** 12V DC motors
+- **Current:** Check motor specs and ensure H-bridge can handle load
+
+---
+
+## 🔧 H-Bridge Connections
+
+```
+L298N Module Connections:
+─────────────────────────
+
+Power:
+  12V    → External 12V power supply (+)
+  GND    → Common ground (Pico GND + 12V supply GND)
+  5V     → Pico VBUS (or leave jumper if using onboard regulator)
+
+Motor A (Right):
+  OUT1   → Motor A Wire 1
+  OUT2   → Motor A Wire 2
+
+Motor B (Left):
+  OUT3   → Motor B Wire 1
+  OUT4   → Motor B Wire 2
+
+Control (to Pico):
+  ENA    → GPIO 15 (PWM)
+  IN1    → GPIO 17
+  IN2    → GPIO 16
+  ENB    → GPIO 13 (PWM)
+  IN3    → GPIO 19
+  IN4    → GPIO 18
+```
+
+---
+
+## ✅ Initialization Sequence
+
+On startup, the gantry performs an automatic initialization:
+
+1. **Display:** "Moving Away From Limits..."
+2. **Back Movement:** 1.5 seconds (clears Y-axis limit)
+3. **Left Movement:** 1.5 seconds (clears X-axis limit)
+4. **Stop:** Motors halt
+5. **Ready:** Display shows "Ready!" and awaits button input
+
+---
+
+## 🐛 Troubleshooting
+
+### LCD Not Displaying
+- Check I2C address (run I2C scanner if needed)
+- Verify SDA/SCL connections
+- Check power to LCD module
+
+### Motors Not Running
+- Verify common ground between Pico and H-bridge
+- Check 12V power supply to H-bridge
+- Test motor connections directly to 12V
+
+### Buttons Not Responding
+- Verify button connections to correct GPIO pins
+- Check 3.3V supply to button terminals
+- LCD should show button states: `F:0 R:0 / L:0 B:0`
+
+### Erratic Movement
+- Check for loose motor connections
+- Verify PWM enable pins are connected
+- Ensure adequate power supply current capacity
+
+---
+
+## 📝 Notes
+
+- **Debouncing:** Implemented in software (double-read with 100μs delay)
+- **Update Rate:** 20ms loop cycle
+- **PWM Frequency:** Default RP2040 PWM (based on 125MHz clock / 65535 wrap)
+- **Pull Resistors:** All buttons use internal pull-down resistors
+
+---
+
+## 🔗 Related Files
+
+- `Embedded2.c` - Main firmware source code
+- `CMakeLists.txt` - Build configuration
+- `build/Embedded2.uf2` - Compiled firmware (drag to RPI-RP2 drive)
+
+---
+
+**Last Updated:** December 2025  
+**Hardware:** Raspberry Pi Pico (RP2040)  
+**SDK Version:** Pico SDK 2.2.0

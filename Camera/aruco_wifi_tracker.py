@@ -1,24 +1,24 @@
 """
-Aruco Marker WiFi Tracking System for Forge Registry Station
-Tracks Aruco markers on 5x5 grid and sends data to Pico W via WiFi (UDP)
+Aruco Marker Serial Tracking System for Forge Registry Station
+Tracks Aruco markers on 5x5 grid and streams coordinates to the Pico over USB serial
 Author: GitHub Copilot
 Date: December 2025
 """
 
 import cv2
 import numpy as np
-import socket
 import time
-import json
+import serial
+import serial.tools.list_ports
 
 # ============================================================================
 # CONFIGURATION SECTION
 # ============================================================================
 
-# WiFi/Network Configuration
-PICO_IP = "192.168.1.100"  # Change to your Pico W's IP address
-PICO_PORT = 5000           # UDP port on Pico
-LOCAL_PORT = 5001          # Local UDP port for receiving responses
+# Serial Configuration
+SERIAL_PORT = "COM5"      # Change to the Pico's COM port (e.g., COM5 on Windows, /dev/ttyACM0 on Linux)
+SERIAL_BAUD = 115200
+SERIAL_TIMEOUT = 0.01      # Seconds
 
 # Grid Configuration
 GRID_SIZE = 5  # 5x5 grid
@@ -197,59 +197,45 @@ def pixel_to_grid(cx, cy, frame_width, frame_height, grid_size=5):
     return row, col
 
 # ============================================================================
-# NETWORK COMMUNICATION FUNCTIONS
+# SERIAL COMMUNICATION FUNCTIONS
 # ============================================================================
 
-def create_udp_socket():
-    """Create and configure UDP socket for communication"""
+def pick_serial_port(preferred):
+    """Try preferred port, otherwise suggest available ones."""
+    ports = list(serial.tools.list_ports.comports())
+    names = [p.device for p in ports]
+    if preferred in names:
+        return preferred, names
+    return (names[0] if names else None), names
+
+
+def open_serial(port, baud):
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.settimeout(0.01)  # Non-blocking with 10ms timeout
-        sock.bind(('', LOCAL_PORT))
-        print(f"UDP socket bound to port {LOCAL_PORT}")
-        return sock
+        ser = serial.Serial(port, baudrate=baud, timeout=SERIAL_TIMEOUT)
+        print(f"Serial connected on {port} @ {baud} baud")
+        return ser
     except Exception as e:
-        print(f"ERROR creating UDP socket: {e}")
+        print(f"ERROR opening serial port '{port}': {e}")
         return None
 
-def send_marker_data(sock, marker_data_list):
-    """
-    Send marker data to Pico W via UDP
-    Format: JSON with list of detected markers
-    """
-    if sock is None:
+
+def send_marker_data(ser, marker_data_list):
+    """Send the first detected marker as CSV: id,row,col\n"""
+    if ser is None:
         return False
-    
+    if not marker_data_list:
+        return False
+
+    # Choose the largest marker to prioritize the closest/clearest
+    primary = sorted(marker_data_list, key=lambda m: m.get('area', 0), reverse=True)[0]
+    line = f"{primary['id']},{primary['grid_row']},{primary['grid_col']}\n"
     try:
-        # Prepare data packet
-        packet = {
-            'timestamp': time.time(),
-            'markers': marker_data_list
-        }
-        
-        # Convert to JSON and send
-        message = json.dumps(packet).encode('utf-8')
-        sock.sendto(message, (PICO_IP, PICO_PORT))
+        ser.write(line.encode('utf-8'))
+        ser.flush()
         return True
     except Exception as e:
-        print(f"ERROR sending data: {e}")
+        print(f"ERROR writing to serial: {e}")
         return False
-
-def receive_pico_response(sock):
-    """Receive response from Pico W (non-blocking)"""
-    if sock is None:
-        return None
-    
-    try:
-        data, addr = sock.recvfrom(1024)
-        response = json.loads(data.decode('utf-8'))
-        return response
-    except socket.timeout:
-        return None
-    except Exception as e:
-        # Uncomment for debugging: print(f"ERROR receiving data: {e}")
-        return None
 
 # ============================================================================
 # MAIN TRACKING LOOP
@@ -259,12 +245,12 @@ def main():
     """Main function to run the Aruco tracking system"""
     
     print("=" * 70)
-    print("ARUCO MARKER WIFI TRACKING SYSTEM - FORGE REGISTRY STATION")
+    print("ARUCO MARKER SERIAL TRACKER - FORGE REGISTRY STATION")
     print("=" * 70)
     print(f"Grid Size: {GRID_SIZE}×{GRID_SIZE}")
     print(f"Resolution: {FRAME_WIDTH}×{FRAME_HEIGHT}")
     print(f"Target FPS: {TARGET_FPS}")
-    print(f"Pico W IP: {PICO_IP}:{PICO_PORT}")
+    print(f"Serial Port: {SERIAL_PORT} @ {SERIAL_BAUD}")
     print(f"Send Rate: {int(1/SEND_INTERVAL)} Hz")
     print("\nControls:")
     print("  'q' - Quit application")
@@ -272,10 +258,16 @@ def main():
     print("  's' - Save current frame")
     print("=" * 70)
     
-    # Initialize UDP socket
-    sock = create_udp_socket()
-    if sock is None:
-        print("Failed to create UDP socket. Exiting...")
+    # Initialize serial
+    port, available = pick_serial_port(SERIAL_PORT)
+    if port is None:
+        print("No serial ports found. Plug in the Pico and try again.")
+        return
+    if port != SERIAL_PORT:
+        print(f"Using detected port: {port} (preferred {SERIAL_PORT}). Available: {available}")
+    ser = open_serial(port, SERIAL_BAUD)
+    if ser is None:
+        print("Failed to open serial port. Exiting...")
         return
     
     # Initialize webcam
@@ -286,7 +278,7 @@ def main():
     
     if not cap.isOpened():
         print("ERROR: Cannot access camera!")
-        sock.close()
+        ser.close()
         return
     
     # Display camera info
@@ -312,7 +304,6 @@ def main():
     
     # Pico status
     pico_status = "WAITING"
-    last_pico_response = None
     
     while True:
         # Capture frame
@@ -337,23 +328,11 @@ def main():
         current_time = time.time()
         if current_time - last_send_time >= SEND_INTERVAL:
             if marker_data:
-                success = send_marker_data(sock, marker_data)
-                if success:
-                    pico_status = "SENT"
-                else:
-                    pico_status = "FAILED"
+                success = send_marker_data(ser, marker_data)
+                pico_status = "SENT" if success else "FAILED"
             else:
-                # Send empty marker list
-                send_marker_data(sock, [])
                 pico_status = "NO MARKERS"
-            
             last_send_time = current_time
-        
-        # Check for response from Pico
-        response = receive_pico_response(sock)
-        if response:
-            last_pico_response = response
-            pico_status = f"ACK: {response.get('state', 'OK')}"
         
         # Draw markers on frame
         frame = draw_aruco_markers(frame, corners, ids, marker_data)
@@ -417,7 +396,7 @@ def main():
     # Cleanup
     cap.release()
     cv2.destroyAllWindows()
-    sock.close()
+    ser.close()
     print("Application closed successfully.")
 
 # ============================================================================

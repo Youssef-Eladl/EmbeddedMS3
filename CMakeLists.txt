@@ -41,16 +41,15 @@ pico_set_program_name(EmbeddedMS3 "EmbeddedMS3")
 pico_set_program_version(EmbeddedMS3 "0.1")
 
 # Modify the below lines to enable/disable output over UART/USB
-pico_enable_stdio_uart(EmbeddedMS3 1)
+pico_enable_stdio_uart(EmbeddedMS3 0)
 pico_enable_stdio_usb(EmbeddedMS3 1)
 
 # Add the standard library to the build
 target_link_libraries(EmbeddedMS3
         pico_stdlib
-        pico_cyw43_arch_lwip_threadsafe_background
-        hardware_adc
         hardware_pwm
-        hardware_i2c
+    hardware_i2c
+    hardware_adc
 )
 
 # Add the standard include files to the build

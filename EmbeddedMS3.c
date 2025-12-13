@@ -1,7 +1,7 @@
 /**
  * Forge Registry Station - Aruco Plate Positioning System
  * Manual Gantry Control with Real-time Camera Feedback
- * Pico W with WiFi, Motors, Potentiometers, LCD, and Electromagnet
+ * Pico with USB Serial Camera Input, Dual-Pot H-Bot Motion, LCD, and Electromagnet
  */
 
 #include <stdio.h>
@@ -14,10 +14,6 @@
 #include "hardware/pwm.h"
 #include "hardware/i2c.h"
 
-// WiFi includes (must be after pico_stdlib)
-#include "pico/cyw43_arch.h"
-#include "lwip/pbuf.h"
-#include "lwip/udp.h"
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -27,11 +23,13 @@
 #define POT_X_PIN       26  // ADC0 - X-axis control
 #define POT_Y_PIN       27  // ADC1 - Y-axis control
 
-// DC Motor Outputs (PWM for speed control)
-#define MOTOR_X_PWM     2   // X-axis motor PWM
-#define MOTOR_X_DIR     3   // X-axis motor direction
-#define MOTOR_Y_PWM     4   // Y-axis motor PWM
-#define MOTOR_Y_DIR     5   // Y-axis motor direction
+// DC Motor Outputs (L298N style: PWM enable + dual direction pins)
+#define MOTOR_A_PWM     15  // Motor A PWM (ENA)
+#define MOTOR_A_IN1     17  // Motor A direction input 1
+#define MOTOR_A_IN2     16  // Motor A direction input 2
+#define MOTOR_B_PWM     13  // Motor B PWM (ENB)
+#define MOTOR_B_IN3     19  // Motor B direction input 3
+#define MOTOR_B_IN4     18  // Motor B direction input 4
 
 // Limit Switches (for homing)
 #define LIMIT_X_PIN     6   // X-axis limit switch
@@ -41,7 +39,7 @@
 #define MAGNET_PIN      8   // Electromagnet control
 
 // Push Button
-#define BUTTON_PIN      9   // Stage start button
+#define BUTTON_PIN      22   // Stage start button
 
 // Buzzer
 #define BUZZER_PIN      10  // Confirmation buzzer
@@ -59,16 +57,12 @@
 // ============================================================================
 
 #define GRID_SIZE           5
-#define UDP_PORT            5000
 #define ADC_MAX             4095    // 12-bit ADC
-#define DEADZONE            200     // Potentiometer deadzone
+#define DEADZONE            600     // Potentiometer deadzone (larger for stability)
 #define PWM_MAX             65535   // 16-bit PWM
 #define PLACEMENT_TIME      5000    // 5 seconds in milliseconds
 #define BUTTON_DEBOUNCE     50      // Button debounce time (ms)
-
-// WiFi Configuration
-#define WIFI_SSID           "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD       "YOUR_WIFI_PASSWORD"
+#define TEST_DISPLAY_ONLY   0      // Set to 1 to disable motor movement and show commands on LCD
 
 // ============================================================================
 // STATE MACHINE
@@ -124,22 +118,30 @@ static system_state_t current_state = STATE_INIT;
 static camera_data_t camera_data = {0};
 static aruco_plate_t plate_1 = {0};
 static aruco_plate_t plate_2 = {0};
-static struct udp_pcb *udp_pcb_global = NULL;
-static bool button_pressed = false;
 static uint32_t placement_start_time = 0;
 static bool magnet_active = false;
 static int qr_sequence[4] = {5, 4, 3, 2}; // Example: 5432 -> (5,4) and (3,2)
+static int16_t debug_motor_a = 0;
+static int16_t debug_motor_b = 0;
+static uint32_t last_debug_lcd_ms = 0;
+static uint16_t debug_adc_x = 0;
+static uint16_t debug_adc_y = 0;
+static int16_t debug_x_cmd = 0;
+static int16_t debug_y_cmd = 0;
+static uint32_t motors_unlock_time = 0;
+static bool motors_unlocked = false;
 
 // ============================================================================
 // LCD I2C FUNCTIONS (16x2 LCD)
 // ============================================================================
 
 void lcd_send_byte(uint8_t val, int mode) {
-    uint8_t high = (val & 0xF0) | mode | 0x08; // Enable=1, backlight=1
+    uint8_t high = (val & 0xF0) | mode | 0x08; // RS + backlight
     uint8_t low = ((val << 4) & 0xF0) | mode | 0x08;
     
-    uint8_t data[4] = {high, high & ~0x04, low, low & ~0x04}; // Toggle enable
+    uint8_t data[4] = {high | 0x04, high, low | 0x04, low}; // Pulse enable high then low
     i2c_write_blocking(i2c0, LCD_ADDR, data, 4, false);
+    sleep_us(50); // LCD needs time to process
 }
 
 void lcd_send_cmd(uint8_t cmd) {
@@ -157,16 +159,27 @@ void lcd_init(void) {
     gpio_pull_up(I2C_SDA_PIN);
     gpio_pull_up(I2C_SCL_PIN);
     
-    sleep_ms(100);
+    sleep_ms(50); // Wait for LCD power-on (>40ms required)
+    
+    // Send 0x03 three times for 8-bit mode init (HD44780 standard sequence)
     lcd_send_cmd(0x03);
+    sleep_ms(5);
     lcd_send_cmd(0x03);
+    sleep_us(150);
     lcd_send_cmd(0x03);
-    lcd_send_cmd(0x02); // 4-bit mode
-    lcd_send_cmd(0x28); // 2 lines, 5x8 font
-    lcd_send_cmd(0x0C); // Display on, cursor off
-    lcd_send_cmd(0x06); // Increment cursor
+    sleep_us(150);
+    
+    lcd_send_cmd(0x02); // Switch to 4-bit mode
+    sleep_us(150);
+    
+    lcd_send_cmd(0x28); // 4-bit mode, 2 lines, 5x8 font
+    sleep_us(50);
+    lcd_send_cmd(0x0C); // Display on, cursor off, blink off
+    sleep_us(50);
+    lcd_send_cmd(0x06); // Entry mode: increment cursor, no display shift
+    sleep_us(50);
     lcd_send_cmd(0x01); // Clear display
-    sleep_ms(2);
+    sleep_ms(2); // Clear needs 1.5ms
 }
 
 void lcd_clear(void) {
@@ -202,41 +215,94 @@ void lcd_printf(int col, int row, const char *format, ...) {
 
 void motors_init(void) {
     // Initialize PWM for motors
-    gpio_set_function(MOTOR_X_PWM, GPIO_FUNC_PWM);
-    gpio_set_function(MOTOR_Y_PWM, GPIO_FUNC_PWM);
+    gpio_set_function(MOTOR_A_PWM, GPIO_FUNC_PWM);
+    gpio_set_function(MOTOR_B_PWM, GPIO_FUNC_PWM);
     
-    uint slice_x = pwm_gpio_to_slice_num(MOTOR_X_PWM);
-    uint slice_y = pwm_gpio_to_slice_num(MOTOR_Y_PWM);
+    uint slice_a = pwm_gpio_to_slice_num(MOTOR_A_PWM);
+    uint slice_b = pwm_gpio_to_slice_num(MOTOR_B_PWM);
     
-    pwm_set_wrap(slice_x, PWM_MAX);
-    pwm_set_wrap(slice_y, PWM_MAX);
-    pwm_set_enabled(slice_x, true);
-    pwm_set_enabled(slice_y, true);
+    pwm_set_wrap(slice_a, PWM_MAX);
+    pwm_set_wrap(slice_b, PWM_MAX);
+    pwm_set_enabled(slice_a, true);
+    pwm_set_enabled(slice_b, true);
     
     // Initialize direction pins
-    gpio_init(MOTOR_X_DIR);
-    gpio_set_dir(MOTOR_X_DIR, GPIO_OUT);
-    gpio_init(MOTOR_Y_DIR);
-    gpio_set_dir(MOTOR_Y_DIR, GPIO_OUT);
+    gpio_init(MOTOR_A_IN1);
+    gpio_set_dir(MOTOR_A_IN1, GPIO_OUT);
+    gpio_init(MOTOR_A_IN2);
+    gpio_set_dir(MOTOR_A_IN2, GPIO_OUT);
+    gpio_init(MOTOR_B_IN3);
+    gpio_set_dir(MOTOR_B_IN3, GPIO_OUT);
+    gpio_init(MOTOR_B_IN4);
+    gpio_set_dir(MOTOR_B_IN4, GPIO_OUT);
 }
 
-void motor_set(uint gpio_pwm, uint gpio_dir, int speed) {
+void motor_set_l298(uint gpio_pwm, uint gpio_in1, uint gpio_in2, int speed) {
     // speed: -255 to +255 (negative = reverse)
-    bool direction = speed >= 0;
+    if (speed == 0) {
+        // Hard stop / brake: both LOW, PWM=0
+        gpio_put(gpio_in1, 0);
+        gpio_put(gpio_in2, 0);
+        pwm_set_gpio_level(gpio_pwm, 0);
+        return;
+    }
+
+    bool forward = speed > 0;
     uint16_t pwm_value = (abs(speed) * PWM_MAX) / 255;
-    
-    gpio_put(gpio_dir, direction);
+
+    gpio_put(gpio_in1, forward ? 1 : 0);
+    gpio_put(gpio_in2, forward ? 0 : 1);
     pwm_set_gpio_level(gpio_pwm, pwm_value);
 }
 
 void motors_stop(void) {
-    motor_set(MOTOR_X_PWM, MOTOR_X_DIR, 0);
-    motor_set(MOTOR_Y_PWM, MOTOR_Y_DIR, 0);
+    motor_set_l298(MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, 0);
+    motor_set_l298(MOTOR_B_PWM, MOTOR_B_IN3, MOTOR_B_IN4, 0);
 }
 
 // ============================================================================
-// POTENTIOMETER CONTROL
+// POTENTIOMETER CONTROL WITH H-BOT MAPPING
 // ============================================================================
+
+static void hbot_drive(int x_cmd, int y_cmd);
+
+const char* get_direction_str(int motor_a, int motor_b) {
+    int threshold = 20; // Minimum value to register movement
+    
+    if (abs(motor_a) < threshold && abs(motor_b) < threshold) {
+        return "STOP";
+    }
+    
+    // Check primary directions
+    if (motor_a > threshold && motor_b > threshold) {
+        if (abs(motor_a - motor_b) < threshold) return "RIGHT";
+        if (motor_a > motor_b) return "RIGHT-UP";
+        return "RIGHT-DN";
+    }
+    if (motor_a < -threshold && motor_b < -threshold) {
+        if (abs(motor_a - motor_b) < threshold) return "LEFT";
+        if (motor_a < motor_b) return "LEFT-UP";
+        return "LEFT-DN";
+    }
+    if (motor_a > threshold && motor_b < -threshold) {
+        if (abs(motor_a + motor_b) < threshold) return "UP";
+        if (motor_a > abs(motor_b)) return "RIGHT-UP";
+        return "UP-LEFT";
+    }
+    if (motor_a < -threshold && motor_b > threshold) {
+        if (abs(motor_a + motor_b) < threshold) return "DOWN";
+        if (abs(motor_a) > motor_b) return "LEFT-DN";
+        return "DOWN-RT";
+    }
+    
+    // Edge cases
+    if (motor_a > threshold) return "RIGHT-UP";
+    if (motor_a < -threshold) return "LEFT-DN";
+    if (motor_b > threshold) return "DOWN";
+    if (motor_b < -threshold) return "UP";
+    
+    return "STOP";
+}
 
 void adc_init_all(void) {
     adc_init();
@@ -244,29 +310,123 @@ void adc_init_all(void) {
     adc_gpio_init(POT_Y_PIN);
 }
 
-int read_pot_with_deadzone(uint adc_channel) {
-    adc_select_input(adc_channel);
-    int raw = adc_read();
+static int read_pot_with_deadzone(uint adc_channel) {
+    // Average 8 readings to reduce noise
+    uint32_t sum = 0;
+    for (int i = 0; i < 8; i++) {
+        adc_select_input(adc_channel);
+        sum += adc_read();
+        sleep_us(10);
+    }
+    int raw = sum / 8;
     
-    int centered = raw - (ADC_MAX / 2);
-    
+    int mid = ADC_MAX / 2;          // ~2047 corresponds to 1.65V (3.3V/2)
+    int centered = raw - mid;        // negative below 1.65V, positive above
+
+    // Small deadzone around center (~0.02V default)
     if (abs(centered) < DEADZONE) {
         return 0;
     }
-    
-    // Map to -255 to +255
-    int speed = (centered * 255) / (ADC_MAX / 2);
-    speed = (speed > 255) ? 255 : (speed < -255) ? -255 : speed;
-    
-    return speed;
+
+    // Normalize to -1..+1 using 1.65V span, then scale to -255..255
+    float norm = (float)centered / (float)mid;
+    float scaled = norm * 255.0f;
+    if (scaled > 255.0f) scaled = 255.0f;
+    if (scaled < -255.0f) scaled = -255.0f;
+    return (int)scaled;
 }
 
-void update_motors_from_pots(void) {
-    int x_speed = read_pot_with_deadzone(0); // ADC0
-    int y_speed = read_pot_with_deadzone(1); // ADC1
+static void update_motors_from_pots_hbot(void) {
+    // Read raw ADC values for debugging
+    adc_select_input(0);
+    uint32_t sum_x = 0;
+    for (int i = 0; i < 8; i++) {
+        sum_x += adc_read();
+        sleep_us(10);
+    }
+    debug_adc_x = sum_x / 8;
     
-    motor_set(MOTOR_X_PWM, MOTOR_X_DIR, x_speed);
-    motor_set(MOTOR_Y_PWM, MOTOR_Y_DIR, y_speed);
+    adc_select_input(1);
+    uint32_t sum_y = 0;
+    for (int i = 0; i < 8; i++) {
+        sum_y += adc_read();
+        sleep_us(10);
+    }
+    debug_adc_y = sum_y / 8;
+    
+    int x_cmd = read_pot_with_deadzone(0); // ADC0 -> X axis
+    int y_cmd = read_pot_with_deadzone(1); // ADC1 -> Y axis
+    debug_x_cmd = x_cmd;
+    debug_y_cmd = y_cmd;
+    hbot_drive(x_cmd, y_cmd);
+
+    // Display values for testing
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now - last_debug_lcd_ms > 200) { // update ~5 Hz to reduce flicker
+        const char* dir = get_direction_str(debug_motor_a, debug_motor_b);
+        
+        if (TEST_DISPLAY_ONLY) {
+            // Line 0: Raw ADC values (0-4095)
+            lcd_set_cursor(0, 0);
+            char buf0[17];
+            snprintf(buf0, sizeof(buf0), "X:%4d Y:%4d", debug_adc_x, debug_adc_y);
+            lcd_print(buf0);
+            // Line 1: Computed commands and motor outputs
+            lcd_set_cursor(0, 1);
+            char buf1[17];
+            snprintf(buf1, sizeof(buf1), "A:%+4d B:%+4d", debug_motor_a, debug_motor_b);
+            lcd_print(buf1);
+        } else {
+            // Normal mode: motor commands + direction
+            lcd_set_cursor(0, 0);
+            char buf0[17];
+            snprintf(buf0, sizeof(buf0), "A:%+4d B:%+4d", debug_motor_a, debug_motor_b);
+            lcd_print(buf0);
+            
+            lcd_set_cursor(0, 1);
+            char buf1[17];
+            if (!motors_unlocked) {
+                uint32_t remaining = (motors_unlock_time - now + 999) / 1000; // Round up
+                snprintf(buf1, sizeof(buf1), "%s WAIT:%ds", dir, (int)remaining);
+            } else {
+                snprintf(buf1, sizeof(buf1), "DIR: %s", dir);
+            }
+            lcd_print(buf1);
+        }
+        last_debug_lcd_ms = now;
+    }
+}
+
+static void hbot_drive(int x_cmd, int y_cmd) {
+    // H-bot mapping:
+    //  - Pure X: both motors same direction (neg X => both CCW)
+    //  - Pure Y: motors opposite directions
+    int motor_a = x_cmd + y_cmd;
+    int motor_b = x_cmd - y_cmd;
+
+    // Clamp combined commands to valid range
+    if (motor_a > 255) motor_a = 255;
+    if (motor_a < -255) motor_a = -255;
+    if (motor_b > 255) motor_b = 255;
+    if (motor_b < -255) motor_b = -255;
+
+    debug_motor_a = (int16_t)motor_a;
+    debug_motor_b = (int16_t)motor_b;
+
+    if (TEST_DISPLAY_ONLY) {
+        motors_stop(); // Hard stop: inputs low, PWM=0
+        return;
+    }
+    
+    // Check if motors are unlocked (10 second wait after homing)
+    if (!motors_unlocked) {
+        motors_stop();
+        return;
+    }
+    
+    // Motors unlocked - normal operation
+    motor_set_l298(MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, motor_a);
+    motor_set_l298(MOTOR_B_PWM, MOTOR_B_IN3, MOTOR_B_IN4, motor_b);
 }
 
 // ============================================================================
@@ -289,7 +449,7 @@ bool homing_sequence(void) {
     
     // Home X-axis
     while (!gpio_get(LIMIT_X_PIN)) {
-        motor_set(MOTOR_X_PWM, MOTOR_X_DIR, -100); // Move backwards
+        hbot_drive(-100, 0); // Negative X: both motors CCW
         sleep_ms(10);
     }
     motors_stop();
@@ -297,7 +457,7 @@ bool homing_sequence(void) {
     
     // Home Y-axis
     while (!gpio_get(LIMIT_Y_PIN)) {
-        motor_set(MOTOR_Y_PWM, MOTOR_Y_DIR, -100);
+        hbot_drive(0, -100); // Negative Y: motors opposite
         sleep_ms(10);
     }
     motors_stop();
@@ -376,87 +536,49 @@ bool button_check(void) {
     return false;
 }
 
+
 // ============================================================================
-// UDP RECEIVE CALLBACK
+// USB SERIAL PARSING (Camera → Pico)
 // ============================================================================
 
-void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
-                       const ip_addr_t *addr, u16_t port) {
-    if (p != NULL) {
-        char *data = (char *)p->payload;
-        
-        // Simple JSON parsing (look for "id", "grid_row", "grid_col")
-        // Example: {"markers":[{"id":1,"grid_row":0,"grid_col":0,...}]}
-        
-        char *id_str = strstr(data, "\"id\":");
-        char *row_str = strstr(data, "\"grid_row\":");
-        char *col_str = strstr(data, "\"grid_col\":");
-        
-        if (id_str && row_str && col_str) {
-            int id = atoi(id_str + 5);
-            int row = atoi(row_str + 11);
-            int col = atoi(col_str + 11);
-            
-            camera_data.detected_marker.id = id;
-            camera_data.detected_marker.grid_row = row;
-            camera_data.detected_marker.grid_col = col;
-            camera_data.detected_marker.valid = true;
-            camera_data.marker_detected = true;
-            camera_data.current_x = col;
-            camera_data.current_y = row;
-            camera_data.last_update_time = to_ms_since_boot(get_absolute_time());
-            
-            printf("Received marker: ID=%d at (%d,%d)\n", id, row, col);
-        }
-        
-        // Send acknowledgment
-        char ack[] = "{\"state\":\"OK\"}";
-        struct pbuf *p_ack = pbuf_alloc(PBUF_TRANSPORT, strlen(ack), PBUF_RAM);
-        if (p_ack != NULL) {
-            memcpy(p_ack->payload, ack, strlen(ack));
-            udp_sendto(pcb, p_ack, addr, port);
-            pbuf_free(p_ack);
-        }
-        
-        pbuf_free(p);
+static char serial_buffer[128];
+static uint8_t serial_idx = 0;
+
+void handle_serial_line(const char *line) {
+    // Expected format: id,row,col (all ints, 0-indexed)
+    int id = 0, row = 0, col = 0;
+    if (sscanf(line, "%d,%d,%d", &id, &row, &col) == 3) {
+        camera_data.detected_marker.id = id;
+        camera_data.detected_marker.grid_row = row;
+        camera_data.detected_marker.grid_col = col;
+        camera_data.detected_marker.valid = true;
+        camera_data.marker_detected = true;
+        camera_data.current_x = col;
+        camera_data.current_y = row;
+        camera_data.last_update_time = to_ms_since_boot(get_absolute_time());
+        printf("SER RX -> ID:%d ROW:%d COL:%d\n", id, row, col);
     }
 }
 
-// ============================================================================
-// WIFI INITIALIZATION
-// ============================================================================
-
-bool wifi_init_sta(void) {
-    if (cyw43_arch_init()) {
-        printf("WiFi init failed\n");
-        return false;
-    }
-    
-    cyw43_arch_enable_sta_mode();
-    
-    printf("Connecting to WiFi: %s\n", WIFI_SSID);
-    if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, 
-                                           CYW43_AUTH_WPA2_AES_PSK, 30000)) {
-        printf("WiFi connection failed\n");
-        return false;
-    }
-    
-    printf("WiFi connected!\n");
-    printf("IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_list)));
-    
-    // Setup UDP server
-    udp_pcb_global = udp_new();
-    if (udp_pcb_global != NULL) {
-        err_t err = udp_bind(udp_pcb_global, IP_ADDR_ANY, UDP_PORT);
-        if (err == ERR_OK) {
-            udp_recv(udp_pcb_global, udp_recv_callback, NULL);
-            printf("UDP server listening on port %d\n", UDP_PORT);
-            return true;
+void poll_serial(void) {
+    while (true) {
+        int ch = getchar_timeout_us(0);
+        if (ch == PICO_ERROR_TIMEOUT) {
+            break;
+        }
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            serial_buffer[serial_idx] = '\0';
+            handle_serial_line(serial_buffer);
+            serial_idx = 0;
+        } else if (serial_idx < sizeof(serial_buffer) - 1) {
+            serial_buffer[serial_idx++] = (char)ch;
+        } else {
+            serial_idx = 0; // overflow, reset
         }
     }
-    
-    printf("UDP setup failed\n");
-    return false;
 }
 
 // ============================================================================
@@ -490,7 +612,7 @@ void update_lcd_for_state(void) {
     switch (current_state) {
         case STATE_WAIT_PLATE_1:
             lcd_printf(0, 0, "PLACE ARUCO");
-            lcd_printf(0, 1, "at (1,1) BTN=GO");
+            lcd_printf(0, 1, "at (1,1)");
             break;
             
         case STATE_PICK_PLATE_1:
@@ -513,7 +635,7 @@ void update_lcd_for_state(void) {
             
         case STATE_WAIT_PLATE_2:
             lcd_printf(0, 0, "ADD ARUCO #2");
-            lcd_printf(0, 1, "at (1,1) BTN=GO");
+            lcd_printf(0, 1, "at (1,1)");
             break;
             
         case STATE_PICK_PLATE_2:
@@ -562,34 +684,20 @@ void state_machine_update(void) {
             
         case STATE_HOMING:
             if (homing_sequence()) {
-                current_state = STATE_WAIT_PLATE_1;
-                update_lcd_for_state();
+                // Skip plate placement for now - just loop pot control
+                // Set 10-second motor lock
+                motors_unlocked = false;
+                motors_unlock_time = to_ms_since_boot(get_absolute_time()) + 10000;
+                lcd_clear();
+                lcd_printf(0, 0, "HOMING DONE");
+                lcd_printf(0, 1, "10s WAIT...");
+                sleep_ms(1500);
+                current_state = STATE_COMPLETE;
             }
             break;
             
         case STATE_WAIT_PLATE_1:
-            if (button_check()) {
-                if (camera_data.marker_detected && 
-                    (camera_data.detected_marker.id == 1 || 
-                     camera_data.detected_marker.id == 2)) {
-                    // Determine which plate was detected
-                    if (camera_data.detected_marker.id == 1) {
-                        // ID 1 goes to target 1
-                    } else {
-                        // ID 2 goes to target 2 - swap targets
-                        int temp_x = plate_1.target_x;
-                        int temp_y = plate_1.target_y;
-                        plate_1.target_x = plate_2.target_x;
-                        plate_1.target_y = plate_2.target_y;
-                        plate_2.target_x = temp_x;
-                        plate_2.target_y = temp_y;
-                    }
-                    current_state = STATE_PICK_PLATE_1;
-                    update_lcd_for_state();
-                    magnet_set(true);
-                    buzzer_beep(100);
-                }
-            }
+            // Disabled for now
             break;
             
         case STATE_PICK_PLATE_1:
@@ -600,7 +708,7 @@ void state_machine_update(void) {
             break;
             
         case STATE_MOVE_PLATE_1:
-            update_motors_from_pots();
+            update_motors_from_pots_hbot();
             
             // Update LCD with current position
             if (current_time % 200 < 10) { // Update every ~200ms
@@ -618,7 +726,7 @@ void state_machine_update(void) {
             break;
             
         case STATE_VERIFY_PLATE_1:
-            update_motors_from_pots();
+            update_motors_from_pots_hbot();
             
             if (!check_target_reached(plate_1.target_x, plate_1.target_y)) {
                 // Moved away, restart timer
@@ -639,13 +747,11 @@ void state_machine_update(void) {
             break;
             
         case STATE_WAIT_PLATE_2:
-            if (button_check()) {
-                if (camera_data.marker_detected) {
-                    current_state = STATE_PICK_PLATE_2;
-                    update_lcd_for_state();
-                    magnet_set(true);
-                    buzzer_beep(100);
-                }
+            if (camera_data.marker_detected) {
+                current_state = STATE_PICK_PLATE_2;
+                update_lcd_for_state();
+                magnet_set(true);
+                buzzer_beep(100);
             }
             break;
             
@@ -657,7 +763,7 @@ void state_machine_update(void) {
             break;
             
         case STATE_MOVE_PLATE_2:
-            update_motors_from_pots();
+            update_motors_from_pots_hbot();
             
             if (current_time % 200 < 10) {
                 update_lcd_for_state();
@@ -673,7 +779,7 @@ void state_machine_update(void) {
             break;
             
         case STATE_VERIFY_PLATE_2:
-            update_motors_from_pots();
+            update_motors_from_pots_hbot();
             
             if (!check_target_reached(plate_2.target_x, plate_2.target_y)) {
                 placement_start_time = 0;
@@ -693,7 +799,15 @@ void state_machine_update(void) {
             break;
             
         case STATE_COMPLETE:
-            // Stay in complete state
+            // Check if 10-second wait is over
+            if (!motors_unlocked) {
+                if (to_ms_since_boot(get_absolute_time()) >= motors_unlock_time) {
+                    motors_unlocked = true;
+                    buzzer_beep(200); // Signal motors are now active
+                }
+            }
+            // Manual pot control - update motors continuously (respects unlock)
+            update_motors_from_pots_hbot();
             break;
     }
 }
@@ -714,6 +828,10 @@ int main() {
     printf("Initializing peripherals...\n");
     lcd_init();
     lcd_clear();
+    lcd_printf(0, 0, "HELLO WORLD");
+    lcd_printf(0, 1, "LCD CHECK");
+    sleep_ms(1500);
+    lcd_clear();
     lcd_printf(0, 0, "FORGE REGISTRY");
     lcd_printf(0, 1, "INITIALIZING...");
     
@@ -727,32 +845,28 @@ int main() {
     
     buzzer_beep(100);
     
-    // Initialize WiFi
-    printf("Connecting to WiFi...\n");
-    lcd_clear();
-    lcd_printf(0, 0, "CONNECTING WIFI");
+    printf("System ready (USB serial input)\n");
     
-    if (!wifi_init_sta()) {
-        printf("WiFi initialization failed!\n");
+    if (TEST_DISPLAY_ONLY) {
+        // Test mode: skip state machine, just display pot readings
+        printf("TEST MODE: Displaying pot inputs on LCD\n");
         lcd_clear();
-        lcd_printf(0, 0, "WIFI FAILED!");
-        while (1) {
-            tight_loop_contents();
+        lcd_printf(0, 0, "TEST MODE");
+        sleep_ms(1000);
+        
+        while (true) {
+            update_motors_from_pots_hbot();
+            sleep_ms(50); // ~20Hz update rate
         }
-    }
-    
-    lcd_clear();
-    lcd_printf(0, 0, "WIFI CONNECTED");
-    sleep_ms(2000);
-    
-    printf("System ready!\n");
-    current_state = STATE_INIT;
-    
-    // Main loop
-    while (true) {
-        cyw43_arch_poll(); // Handle WiFi events
-        state_machine_update();
-        sleep_ms(10); // Small delay to prevent tight loop
+    } else {
+        // Normal operation with full state machine
+        current_state = STATE_INIT;
+        
+        while (true) {
+            poll_serial();
+            state_machine_update();
+            sleep_ms(10); // Small delay to prevent tight loop
+        }
     }
     
     return 0;
