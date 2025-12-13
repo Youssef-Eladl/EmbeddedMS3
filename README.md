@@ -33,10 +33,6 @@ Key tunables (top of `EmbeddedMS3.c`):
 2) Build: `ninja` (or run the **Compile Project** VS Code task).
 3) Flash `build/EmbeddedMS3.uf2` to the Pico (drag-drop or your usual flasher).
 
-Notes:
-- WiFi/lwIP are removed; only `pico_stdlib`, `hardware_pwm`, and `hardware_i2c` are linked.
-- USB CDC is the console (UART stdio disabled).
-
 ## Camera Tracker (Python → USB Serial)
 1) `cd Camera`
 2) Install deps: `pip install -r requirements.txt` (needs OpenCV with ArUco + pyserial)
@@ -77,9 +73,3 @@ Notes:
 - `Camera/aruco_wifi_tracker.py` – serial ArUco tracker (USB CDC output).
 - `Camera/requirements.txt` – Python deps.
 - Legacy docs retained: `QUICKSTART.md`, `FORGE_REGISTRY_SETUP.md`, `WIRING_DIAGRAM.md`, `Camera/CAMERA_README.md` (superseded by this README).
-
-## License & Credit
-Project: Forge Registry Station – Milestone 3, Station 4  
-Platform: Raspberry Pi Pico (USB CDC)  
-Date: December 2025  
-Author: GitHub Copilot

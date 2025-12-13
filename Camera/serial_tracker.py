@@ -30,7 +30,7 @@ UPPER_HSV_ALT = np.array([180, 255, 255])
 
 GRID_SIZE = 5
 MIN_OBJECT_AREA = 100
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 
 # ============================================================================
 # SERIAL COMMUNICATION FUNCTIONS

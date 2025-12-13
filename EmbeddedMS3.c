@@ -1,57 +1,7 @@
-
-// ----------------------------------------------------------------------------
-// CAMERA FEEDBACK → LCD
-// ----------------------------------------------------------------------------
-// Shows latest parsed camera values on the 16x2 LCD.
-static void lcd_show_camera_feedback(void) {
-    // Line 0: Marker ID and grid (display 1-based grid for readability)
-    char line0[17];
-    int id = camera_data.detected_marker.id;
-    int r = camera_data.detected_marker.grid_row;
-    int c = camera_data.detected_marker.grid_col;
-    if (r < 0) r = 0; if (c < 0) c = 0; // basic safety
-    lcd_set_cursor(0, 0);
-    snprintf(line0, sizeof(line0), "ID:%3d R:%d C:%d", id, r + 1, c + 1);
-    lcd_print(line0);
-
-    // Line 1: X/Y (1-based) and age since last update
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    uint32_t age_ms = now - camera_data.last_update_time;
-    char line1[17];
-    lcd_set_cursor(0, 1);
-    snprintf(line1, sizeof(line1), "X:%d Y:%d %4dms", camera_data.current_x + 1, camera_data.current_y + 1, (int)age_ms);
-    lcd_print(line1);
-}
-
-// Replace omitted body: parse CSV from Python and update LCD
-void handle_serial_line(const char *line);
-void handle_serial_line(const char *line) {
-    // Expected format from Python: "id,row,col\n" with 0-based indices
-    int id = 0, row = 0, col = 0;
-    if (sscanf(line, "%d,%d,%d", &id, &row, &col) == 3) {
-        camera_data.detected_marker.id = id;
-        camera_data.detected_marker.grid_row = row;
-        camera_data.detected_marker.grid_col = col;
-        camera_data.detected_marker.valid = true;
-        camera_data.marker_detected = true;
-
-        // Update current position tracking as row/col
-        camera_data.current_x = col;
-        camera_data.current_y = row;
-        camera_data.last_update_time = to_ms_since_boot(get_absolute_time());
-
-        // Show on LCD, throttled to every 5 seconds to avoid flicker
-        uint32_t now = camera_data.last_update_time;
-        if (now - last_lcd_update_ms >= LCD_UPDATE_INTERVAL_MS) {
-            lcd_show_camera_feedback();
-            last_lcd_update_ms = now;
-        }
-    }
-}
 /**
  * Forge Registry Station - Aruco Plate Positioning System
  * Manual Gantry Control with Real-time Camera Feedback
- * Pico with USB Serial Camera Input, Dual-Pot H-Bot Motion, LCD, and Electromagnet
+ * Pico with USB Serial Camera Input, Dual-Pot H-Bot Motion, LCD, and Electromagn et
  */
 
 #include <stdio.h>
@@ -82,14 +32,16 @@ void handle_serial_line(const char *line) {
 #define MOTOR_B_IN4     18  // Motor B direction input 4
 
 // Limit Switches (for homing)
-#define LIMIT_X_PIN     6   // X-axis limit switch
-#define LIMIT_Y_PIN     7   // Y-axis limit switch
+#define LIMIT_X_PIN     22   // X-axis limit switch (emergency stop)
+#define LIMIT_Y_PIN     21   // Y-axis limit switch (emergency stop)
 
-// Electromagnet
-#define MAGNET_PIN      8   // Electromagnet control
+// Electromagnet H-Bridge
+#define MAGNET_PIN      2   // Electromagnet control (H-bridge enable)
+#define EM_IN1          3   // Electromagnet direction control 1
+#define EM_IN2          4   // Electromagnet direction control 2
 
 // Push Button
-#define BUTTON_PIN      22   // Stage start button
+#define BUTTON_PIN      9   // Stage start button (unused)
 
 // Buzzer
 #define BUZZER_PIN      10  // Confirmation buzzer
@@ -113,6 +65,8 @@ void handle_serial_line(const char *line) {
 #define PLACEMENT_TIME      5000    // 5 seconds in milliseconds
 #define BUTTON_DEBOUNCE     50      // Button debounce time (ms)
 #define TEST_DISPLAY_ONLY   0      // Set to 1 to disable motor movement and show commands on LCD
+#define ADC_SAMPLES         16      // Number of samples to average (increased for stability)
+#define SMOOTHING_FACTOR    0.3f    // Exponential smoothing (0.0-1.0, lower = smoother)
 
 // ============================================================================
 // STATE MACHINE
@@ -178,8 +132,10 @@ static uint16_t debug_adc_x = 0;
 static uint16_t debug_adc_y = 0;
 static int16_t debug_x_cmd = 0;
 static int16_t debug_y_cmd = 0;
-static uint32_t motors_unlock_time = 0;
-static bool motors_unlocked = false;
+// Smoothed values for exponential filtering
+static float smoothed_x = 0.0f;
+static float smoothed_y = 0.0f;
+static bool smoothing_initialized = false;
 // LCD update throttle: wait at least 5 seconds between camera refreshes
 static const uint32_t LCD_UPDATE_INTERVAL_MS = 5000;
 static uint32_t last_lcd_update_ms = 0;
@@ -262,6 +218,30 @@ void lcd_printf(int col, int row, const char *format, ...) {
     lcd_print(buffer);
 }
 
+// ----------------------------------------------------------------------------
+// CAMERA FEEDBACK → LCD
+// ----------------------------------------------------------------------------
+// Shows latest parsed camera values on the 16x2 LCD.
+static void lcd_show_camera_feedback(void) {
+    // Line 0: Marker ID and grid (display 1-based grid for readability)
+    char line0[17];
+    int id = camera_data.detected_marker.id;
+    int r = camera_data.detected_marker.grid_row;
+    int c = camera_data.detected_marker.grid_col;
+    if (r < 0) r = 0; if (c < 0) c = 0; // basic safety
+    lcd_set_cursor(0, 0);
+    snprintf(line0, sizeof(line0), "ID:%3d R:%d C:%d", id, r + 1, c + 1);
+    lcd_print(line0);
+
+    // Line 1: X/Y (1-based) and age since last update
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    uint32_t age_ms = now - camera_data.last_update_time;
+    char line1[17];
+    lcd_set_cursor(0, 1);
+    snprintf(line1, sizeof(line1), "X:%d Y:%d %4dms", camera_data.current_x + 1, camera_data.current_y + 1, (int)age_ms);
+    lcd_print(line1);
+}
+
 // ============================================================================
 // MOTOR CONTROL FUNCTIONS
 // ============================================================================
@@ -318,6 +298,7 @@ void motors_stop(void) {
 // ============================================================================
 
 static void hbot_drive(int x_cmd, int y_cmd);
+bool check_emergency_stop(void); // Forward declaration for emergency stop
 
 const char* get_direction_str(int motor_a, int motor_b) {
     int threshold = 20; // Minimum value to register movement
@@ -364,19 +345,29 @@ void adc_init_all(void) {
 }
 
 static int read_pot_with_deadzone(uint adc_channel) {
-    // Average 8 readings to reduce noise
+    // Average more readings to reduce noise
     uint32_t sum = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < ADC_SAMPLES; i++) {
         adc_select_input(adc_channel);
         sum += adc_read();
         sleep_us(10);
     }
-    int raw = sum / 8;
+    float raw = (float)(sum / ADC_SAMPLES);
     
+    // Apply exponential smoothing to reduce jitter
+    float *smoothed = (adc_channel == 0) ? &smoothed_x : &smoothed_y;
+    if (!smoothing_initialized) {
+        *smoothed = raw;
+        if (adc_channel == 1) smoothing_initialized = true;  // Initialize on second channel
+    } else {
+        *smoothed = (*smoothed * (1.0f - SMOOTHING_FACTOR)) + (raw * SMOOTHING_FACTOR);
+    }
+    
+    int smoothed_int = (int)(*smoothed);
     int mid = ADC_MAX / 2;          // ~2047 corresponds to 1.65V (3.3V/2)
-    int centered = raw - mid;        // negative below 1.65V, positive above
+    int centered = smoothed_int - mid;        // negative below 1.65V, positive above
 
-    // Small deadzone around center (~0.02V default)
+    // Deadzone around center
     if (abs(centered) < DEADZONE) {
         return 0;
     }
@@ -390,34 +381,21 @@ static int read_pot_with_deadzone(uint adc_channel) {
 }
 
 static void update_motors_from_pots_hbot(void) {
-    // Read raw ADC values for debugging
-    adc_select_input(0);
-    uint32_t sum_x = 0;
-    for (int i = 0; i < 8; i++) {
-        sum_x += adc_read();
-        sleep_us(10);
-    }
-    debug_adc_x = sum_x / 8;
-    
-    adc_select_input(1);
-    uint32_t sum_y = 0;
-    for (int i = 0; i < 8; i++) {
-        sum_y += adc_read();
-        sleep_us(10);
-    }
-    debug_adc_y = sum_y / 8;
-    
+    // Read potentiometers with filtering (this already does averaging internally)
     int x_cmd = read_pot_with_deadzone(0); // ADC0 -> X axis
     int y_cmd = read_pot_with_deadzone(1); // ADC1 -> Y axis
+    
+    // Store raw values for debugging (use smoothed values)
+    debug_adc_x = (uint16_t)smoothed_x;
+    debug_adc_y = (uint16_t)smoothed_y;
     debug_x_cmd = x_cmd;
     debug_y_cmd = y_cmd;
+    
     hbot_drive(x_cmd, y_cmd);
 
     // Display values for testing
     uint32_t now = to_ms_since_boot(get_absolute_time());
     if (now - last_debug_lcd_ms > 200) { // update ~5 Hz to reduce flicker
-        const char* dir = get_direction_str(debug_motor_a, debug_motor_b);
-        
         if (TEST_DISPLAY_ONLY) {
             // Line 0: Raw ADC values (0-4095)
             lcd_set_cursor(0, 0);
@@ -429,28 +407,32 @@ static void update_motors_from_pots_hbot(void) {
             char buf1[17];
             snprintf(buf1, sizeof(buf1), "A:%+4d B:%+4d", debug_motor_a, debug_motor_b);
             lcd_print(buf1);
-        } else {
-            // Normal mode: motor commands + direction
-            lcd_set_cursor(0, 0);
-            char buf0[17];
-            snprintf(buf0, sizeof(buf0), "A:%+4d B:%+4d", debug_motor_a, debug_motor_b);
-            lcd_print(buf0);
-            
-            lcd_set_cursor(0, 1);
-            char buf1[17];
-            if (!motors_unlocked) {
-                uint32_t remaining = (motors_unlock_time - now + 999) / 1000; // Round up
-                snprintf(buf1, sizeof(buf1), "%s WAIT:%ds", dir, (int)remaining);
-            } else {
-                snprintf(buf1, sizeof(buf1), "DIR: %s", dir);
-            }
-            lcd_print(buf1);
         }
+        // In normal mode, camera feedback is shown by state machine or handle_serial_line
         last_debug_lcd_ms = now;
     }
 }
 
+// Forward declaration
+uint8_t check_limit_switches(void);
+
 static void hbot_drive(int x_cmd, int y_cmd) {
+    // Check which limit switches are active
+    uint8_t limits = check_limit_switches();
+    bool x_limit = (limits & 0x01) != 0;  // X limit at left (negative X)
+    bool y_limit = (limits & 0x02) != 0;  // Y limit at top (negative Y)
+    
+    // Constrain commands based on active limits
+    // X limit hit: prevent further negative X movement (allow positive X)
+    if (x_limit && x_cmd < 0) {
+        x_cmd = 0;
+    }
+    
+    // Y limit hit: prevent further positive Y movement (allow negative Y to move away)
+    if (y_limit && y_cmd > 0) {
+        y_cmd = 0;
+    }
+    
     // H-bot mapping:
     //  - Pure X: both motors same direction (neg X => both CCW)
     //  - Pure Y: motors opposite directions
@@ -471,13 +453,7 @@ static void hbot_drive(int x_cmd, int y_cmd) {
         return;
     }
     
-    // Check if motors are unlocked (10 second wait after homing)
-    if (!motors_unlocked) {
-        motors_stop();
-        return;
-    }
-    
-    // Motors unlocked - normal operation
+    // Normal operation - drive motors
     motor_set_l298(MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, motor_a);
     motor_set_l298(MOTOR_B_PWM, MOTOR_B_IN3, MOTOR_B_IN4, motor_b);
 }
@@ -489,37 +465,71 @@ static void hbot_drive(int x_cmd, int y_cmd) {
 void homing_init(void) {
     gpio_init(LIMIT_X_PIN);
     gpio_set_dir(LIMIT_X_PIN, GPIO_IN);
-    gpio_pull_up(LIMIT_X_PIN);
+    gpio_pull_down(LIMIT_X_PIN); // Pull-down for active-high switch
     
     gpio_init(LIMIT_Y_PIN);
     gpio_set_dir(LIMIT_Y_PIN, GPIO_IN);
-    gpio_pull_up(LIMIT_Y_PIN);
+    gpio_pull_down(LIMIT_Y_PIN); // Pull-down for active-high switch
+}
+
+// Check limit switches - returns bitmask: bit 0 = X limit, bit 1 = Y limit
+// Does NOT automatically stop motors - caller must handle constraints
+uint8_t check_limit_switches(void) {
+    uint8_t limits = 0;
+    if (gpio_get(LIMIT_X_PIN)) limits |= 0x01;  // X limit active
+    if (gpio_get(LIMIT_Y_PIN)) limits |= 0x02;  // Y limit active
+    return limits;
+}
+
+// Legacy emergency stop - returns true if either limit switch is triggered
+// Used during homing sequence where we want full stops
+bool check_emergency_stop(void) {
+    uint8_t limits = check_limit_switches();
+    if (limits != 0) {
+        motors_stop();
+        return true;
+    }
+    return false;
 }
 
 bool homing_sequence(void) {
+    // PHASE 1: Home X-axis
     lcd_clear();
-    lcd_printf(0, 0, "HOMING...");
+    lcd_printf(0, 0, "HOMING X...");
+    lcd_printf(1, 0, "Moving left");
     
-    // Home X-axis
-    while (!gpio_get(LIMIT_X_PIN)) {
-        hbot_drive(-100, 0); // Negative X: both motors CCW
+    // Move in X direction until Y limit switch triggered (active HIGH)
+    while (!gpio_get(LIMIT_Y_PIN)) {
+        motor_set_l298(MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, -100);
+        motor_set_l298(MOTOR_B_PWM, MOTOR_B_IN3, MOTOR_B_IN4, -100);
         sleep_ms(10);
     }
     motors_stop();
     sleep_ms(500);
     
-    // Home Y-axis
-    while (!gpio_get(LIMIT_Y_PIN)) {
-        hbot_drive(0, -100); // Negative Y: motors opposite
+    printf("X-axis homed (limit switch triggered)\n");
+    
+    // PHASE 2: Home Y-axis
+    lcd_clear();
+    lcd_printf(0, 0, "HOMING Y...");
+    lcd_printf(1, 0, "Moving down");
+    
+    // Move in Y direction until X limit switch triggered (active HIGH)
+    while (!gpio_get(LIMIT_X_PIN)) {
+        motor_set_l298(MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, 100);
+        motor_set_l298(MOTOR_B_PWM, MOTOR_B_IN3, MOTOR_B_IN4, -100);
         sleep_ms(10);
     }
     motors_stop();
+    
+    printf("Y-axis homed (limit switch triggered)\n");
     
     camera_data.current_x = 0;
     camera_data.current_y = 0;
     
     lcd_clear();
     lcd_printf(0, 0, "HOMING COMPLETE");
+    lcd_printf(1, 0, "X=0 Y=0");
     sleep_ms(1000);
     
     return true;
@@ -533,10 +543,28 @@ void magnet_init(void) {
     gpio_init(MAGNET_PIN);
     gpio_set_dir(MAGNET_PIN, GPIO_OUT);
     gpio_put(MAGNET_PIN, 0);
+    
+    gpio_init(EM_IN1);
+    gpio_set_dir(EM_IN1, GPIO_OUT);
+    gpio_put(EM_IN1, 0);
+    
+    gpio_init(EM_IN2);
+    gpio_set_dir(EM_IN2, GPIO_OUT);
+    gpio_put(EM_IN2, 0);
 }
 
 void magnet_set(bool active) {
-    gpio_put(MAGNET_PIN, active);
+    if (active) {
+        // Enable with forward polarity: IN1=HIGH, IN2=LOW
+        gpio_put(EM_IN1, 1);
+        gpio_put(EM_IN2, 0);
+        gpio_put(MAGNET_PIN, 1);
+    } else {
+        // Reverse polarity to help release: IN1=LOW, IN2=HIGH
+        gpio_put(EM_IN1, 0);
+        gpio_put(EM_IN2, 1);
+        gpio_put(MAGNET_PIN, 1);
+    }
     magnet_active = active;
 }
 
@@ -594,10 +622,61 @@ bool button_check(void) {
 // USB SERIAL PARSING (Camera → Pico)
 // ============================================================================
 
+// Forward declaration
+void update_lcd_for_state(void);
+
 static char serial_buffer[128];
 static uint8_t serial_idx = 0;
 
 void handle_serial_line(const char *line) {
+    // Check for PICKUP command: PICKUP,id,target_row,target_col
+    if (strncmp(line, "PICKUP,", 7) == 0) {
+        int id = 0, target_row = 0, target_col = 0;
+        if (sscanf(line, "PICKUP,%d,%d,%d", &id, &target_row, &target_col) == 3) {
+            printf("SER RX -> PICKUP command: ID=%d, Target=(%d,%d)\n", id, target_row+1, target_col+1);
+            
+            // Update plate target based on current state
+            if (current_state == STATE_WAIT_PLATE_1 || current_state == STATE_PICK_PLATE_1) {
+                plate_1.target_x = target_col;  // Note: target_col is X, target_row is Y in grid
+                plate_1.target_y = target_row;
+                printf("Plate 1 target updated: (%d,%d)\n", target_col+1, target_row+1);
+            } else if (current_state == STATE_WAIT_PLATE_2 || current_state == STATE_PICK_PLATE_2) {
+                plate_2.target_x = target_col;
+                plate_2.target_y = target_row;
+                printf("Plate 2 target updated: (%d,%d)\n", target_col+1, target_row+1);
+            }
+        }
+        return;
+    }
+    
+    // Check for RELEASE command
+    if (strncmp(line, "RELEASE", 7) == 0) {
+        printf("SER RX -> RELEASE command received\n");
+        magnet_set(false);  // Turn off electromagnet
+        
+        // Transition to next state based on current state
+        if (current_state == STATE_VERIFY_PLATE_1 || current_state == STATE_MOVE_PLATE_1) {
+            plate_1.placed = true;
+            current_state = STATE_WAIT_PLATE_2;
+            camera_data.marker_detected = false;  // Reset for next marker
+            placement_start_time = 0;
+            motors_stop();
+            buzzer_beep(500);
+            update_lcd_for_state();
+            printf("Transitioning to WAIT_PLATE_2\n");
+        } else if (current_state == STATE_VERIFY_PLATE_2 || current_state == STATE_MOVE_PLATE_2) {
+            plate_2.placed = true;
+            current_state = STATE_COMPLETE;
+            camera_data.marker_detected = false;
+            placement_start_time = 0;
+            motors_stop();
+            buzzer_beep(500);
+            update_lcd_for_state();
+            printf("Transitioning to COMPLETE\n");
+        }
+        return;
+    }
+    
     // Expected format: id,row,col (all ints, 0-indexed)
     int id = 0, row = 0, col = 0;
     if (sscanf(line, "%d,%d,%d", &id, &row, &col) == 3) {
@@ -610,6 +689,13 @@ void handle_serial_line(const char *line) {
         camera_data.current_y = row;
         camera_data.last_update_time = to_ms_since_boot(get_absolute_time());
         printf("SER RX -> ID:%d ROW:%d COL:%d\n", id, row, col);
+        
+        // Show on LCD, throttled to every 5 seconds to avoid flicker
+        uint32_t now = camera_data.last_update_time;
+        if (now - last_lcd_update_ms >= LCD_UPDATE_INTERVAL_MS) {
+            lcd_show_camera_feedback();
+            last_lcd_update_ms = now;
+        }
     }
 }
 
@@ -732,25 +818,43 @@ void state_machine_update(void) {
         case STATE_INIT:
             update_lcd_for_state();
             init_targets_from_qr();
+            magnet_set(false);  // Ensure magnet is off at startup
             current_state = STATE_HOMING;
             break;
             
         case STATE_HOMING:
+            magnet_set(false);  // Keep magnet off during homing
             if (homing_sequence()) {
-                // Skip plate placement for now - just loop pot control
-                // Set 10-second motor lock
-                motors_unlocked = false;
-                motors_unlock_time = to_ms_since_boot(get_absolute_time()) + 10000;
-                lcd_clear();
-                lcd_printf(0, 0, "HOMING DONE");
-                lcd_printf(0, 1, "10s WAIT...");
-                sleep_ms(1500);
-                current_state = STATE_COMPLETE;
+                current_state = STATE_WAIT_PLATE_1;
+                update_lcd_for_state();
             }
             break;
             
         case STATE_WAIT_PLATE_1:
-            // Disabled for now
+            // Auto-proceed when marker detected at position (1,1)
+            if (camera_data.marker_detected && 
+                (camera_data.detected_marker.id == 1 || 
+                 camera_data.detected_marker.id == 2) &&
+                camera_data.detected_marker.grid_row == 0 &&
+                camera_data.detected_marker.grid_col == 0) {
+                // Marker confirmed at (1,1) - proceed with pickup
+                // Determine which plate was detected
+                if (camera_data.detected_marker.id == 1) {
+                    // ID 1 goes to target 1
+                } else {
+                    // ID 2 goes to target 2 - swap targets
+                    int temp_x = plate_1.target_x;
+                    int temp_y = plate_1.target_y;
+                    plate_1.target_x = plate_2.target_x;
+                    plate_1.target_y = plate_2.target_y;
+                    plate_2.target_x = temp_x;
+                    plate_2.target_y = temp_y;
+                }
+                current_state = STATE_PICK_PLATE_1;
+                update_lcd_for_state();
+                magnet_set(true);  // Turn on magnet only after confirming (1,1)
+                buzzer_beep(100);
+            }
             break;
             
         case STATE_PICK_PLATE_1:
@@ -800,10 +904,13 @@ void state_machine_update(void) {
             break;
             
         case STATE_WAIT_PLATE_2:
-            if (camera_data.marker_detected) {
+            // Auto-proceed when marker detected at position (1,1)
+            if (camera_data.marker_detected &&
+                camera_data.detected_marker.grid_row == 0 &&
+                camera_data.detected_marker.grid_col == 0) {
                 current_state = STATE_PICK_PLATE_2;
                 update_lcd_for_state();
-                magnet_set(true);
+                magnet_set(true);  // Turn on magnet only after confirming (1,1)
                 buzzer_beep(100);
             }
             break;
@@ -852,15 +959,8 @@ void state_machine_update(void) {
             break;
             
         case STATE_COMPLETE:
-            // Check if 10-second wait is over
-            if (!motors_unlocked) {
-                if (to_ms_since_boot(get_absolute_time()) >= motors_unlock_time) {
-                    motors_unlocked = true;
-                    buzzer_beep(200); // Signal motors are now active
-                }
-            }
-            // Manual pot control - update motors continuously (respects unlock)
-            update_motors_from_pots_hbot();
+            // Task complete - motors stopped, UV on
+            motors_stop();
             break;
     }
 }
@@ -900,6 +1000,67 @@ int main() {
     
     printf("System ready (USB serial input)\n");
     
+    // Startup delay: wait 10 seconds while displaying motor values
+    printf("Startup delay: 10 seconds...\n");
+    uint32_t start_time = to_ms_since_boot(get_absolute_time());
+    uint32_t delay_duration = 10000; // 10 seconds
+    
+    while (to_ms_since_boot(get_absolute_time()) - start_time < delay_duration) {
+        // Read pots and calculate motor commands (but don't move)
+        adc_select_input(0);
+        uint32_t sum_x = 0;
+        for (int i = 0; i < 8; i++) {
+            sum_x += adc_read();
+            sleep_us(10);
+        }
+        debug_adc_x = sum_x / 8;
+        
+        adc_select_input(1);
+        uint32_t sum_y = 0;
+        for (int i = 0; i < 8; i++) {
+            sum_y += adc_read();
+            sleep_us(10);
+        }
+        debug_adc_y = sum_y / 8;
+        
+        int x_cmd = read_pot_with_deadzone(0);
+        int y_cmd = read_pot_with_deadzone(1);
+        
+        // Calculate motor values
+        int motor_a = x_cmd + y_cmd;
+        int motor_b = x_cmd - y_cmd;
+        if (motor_a > 255) motor_a = 255;
+        if (motor_a < -255) motor_a = -255;
+        if (motor_b > 255) motor_b = 255;
+        if (motor_b < -255) motor_b = -255;
+        
+        // Display countdown and motor values
+        uint32_t remaining = (delay_duration - (to_ms_since_boot(get_absolute_time()) - start_time)) / 1000;
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        char buf0[17];
+        snprintf(buf0, sizeof(buf0), "WAIT:%2ds A:%+4d", (int)remaining, motor_a);
+        lcd_print(buf0);
+        lcd_set_cursor(0, 1);
+        char buf1[17];
+        snprintf(buf1, sizeof(buf1), "X:%4d Y:%4d B:%+4d", debug_adc_x, debug_adc_y, motor_b);
+        lcd_print(buf1);
+        
+        sleep_ms(200); // Update ~5Hz
+    }
+    
+    // Startup movement test: move left for 1 second
+    printf("Startup test: moving left...\n");
+    lcd_clear();
+    lcd_printf(0, 0, "STARTUP TEST");
+    lcd_printf(0, 1, "Moving LEFT...");
+    motor_set_l298(MOTOR_A_PWM, MOTOR_A_IN1, MOTOR_A_IN2, -100); // Left movement
+    motor_set_l298(MOTOR_B_PWM, MOTOR_B_IN3, MOTOR_B_IN4, -100); // Both motors same direction
+    sleep_ms(1000);
+    motors_stop();
+    sleep_ms(500);
+    printf("Startup test complete\n");
+    
     if (TEST_DISPLAY_ONLY) {
         // Test mode: skip state machine, just display pot readings
         printf("TEST MODE: Displaying pot inputs on LCD\n");
@@ -918,7 +1079,7 @@ int main() {
         while (true) {
             poll_serial();
             state_machine_update();
-            sleep_ms(10); // Small delay to prevent tight loop
+            sleep_ms(20); // 50Hz update rate for smoother control
         }
     }
     
