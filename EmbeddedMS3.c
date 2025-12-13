@@ -1,3 +1,53 @@
+
+// ----------------------------------------------------------------------------
+// CAMERA FEEDBACK → LCD
+// ----------------------------------------------------------------------------
+// Shows latest parsed camera values on the 16x2 LCD.
+static void lcd_show_camera_feedback(void) {
+    // Line 0: Marker ID and grid (display 1-based grid for readability)
+    char line0[17];
+    int id = camera_data.detected_marker.id;
+    int r = camera_data.detected_marker.grid_row;
+    int c = camera_data.detected_marker.grid_col;
+    if (r < 0) r = 0; if (c < 0) c = 0; // basic safety
+    lcd_set_cursor(0, 0);
+    snprintf(line0, sizeof(line0), "ID:%3d R:%d C:%d", id, r + 1, c + 1);
+    lcd_print(line0);
+
+    // Line 1: X/Y (1-based) and age since last update
+    uint32_t now = to_ms_since_boot(get_absolute_time());
+    uint32_t age_ms = now - camera_data.last_update_time;
+    char line1[17];
+    lcd_set_cursor(0, 1);
+    snprintf(line1, sizeof(line1), "X:%d Y:%d %4dms", camera_data.current_x + 1, camera_data.current_y + 1, (int)age_ms);
+    lcd_print(line1);
+}
+
+// Replace omitted body: parse CSV from Python and update LCD
+void handle_serial_line(const char *line);
+void handle_serial_line(const char *line) {
+    // Expected format from Python: "id,row,col\n" with 0-based indices
+    int id = 0, row = 0, col = 0;
+    if (sscanf(line, "%d,%d,%d", &id, &row, &col) == 3) {
+        camera_data.detected_marker.id = id;
+        camera_data.detected_marker.grid_row = row;
+        camera_data.detected_marker.grid_col = col;
+        camera_data.detected_marker.valid = true;
+        camera_data.marker_detected = true;
+
+        // Update current position tracking as row/col
+        camera_data.current_x = col;
+        camera_data.current_y = row;
+        camera_data.last_update_time = to_ms_since_boot(get_absolute_time());
+
+        // Show on LCD, throttled to every 5 seconds to avoid flicker
+        uint32_t now = camera_data.last_update_time;
+        if (now - last_lcd_update_ms >= LCD_UPDATE_INTERVAL_MS) {
+            lcd_show_camera_feedback();
+            last_lcd_update_ms = now;
+        }
+    }
+}
 /**
  * Forge Registry Station - Aruco Plate Positioning System
  * Manual Gantry Control with Real-time Camera Feedback
@@ -130,6 +180,9 @@ static int16_t debug_x_cmd = 0;
 static int16_t debug_y_cmd = 0;
 static uint32_t motors_unlock_time = 0;
 static bool motors_unlocked = false;
+// LCD update throttle: wait at least 5 seconds between camera refreshes
+static const uint32_t LCD_UPDATE_INTERVAL_MS = 5000;
+static uint32_t last_lcd_update_ms = 0;
 
 // ============================================================================
 // LCD I2C FUNCTIONS (16x2 LCD)
