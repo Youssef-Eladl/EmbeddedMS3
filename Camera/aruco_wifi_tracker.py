@@ -532,6 +532,24 @@ def send_release_command(ser):
         print(f"ERROR sending release: {e}")
         return False
 
+def send_blob_position(ser, marker_id, row, col):
+    """Send current blob position to Pico for real-time LCD update.
+    Format: id,row,col (same as marker data format)
+    This is used during movement to update the Pico about current position.
+    """
+    if ser is None:
+        return False
+    if row is None or col is None:
+        return False
+    try:
+        line = f"{marker_id},{row},{col}\n"
+        ser.write(line.encode('utf-8'))
+        ser.flush()
+        return True
+    except Exception as e:
+        print(f"ERROR sending blob position: {e}")
+        return False
+
 def send_pickup_command(ser, marker_id, target_row, target_col):
     """Send pickup command to Pico: PICKUP,id,target_row,target_col
     """
@@ -690,6 +708,7 @@ def main():
     plates_completed = 0  # Track how many plates have been placed
     max_plates = 2  # Support 2 plates
     workflow_complete = False
+    detected_marker_ids = set()  # Track IDs already detected to prevent duplicates
     
     # Grid calibration
     v_lines = None
@@ -817,9 +836,11 @@ def main():
         if not pickup_initiated and marker_data and grid_calibrated:
             for data in marker_data:
                 # Position (1,1) in 1-indexed = (0,0) in 0-indexed
-                if data['grid_row'] == 0 and data['grid_col'] == 0:
+                # Skip if this marker ID was already detected/used
+                if data['grid_row'] == 0 and data['grid_col'] == 0 and data['id'] not in detected_marker_ids:
                     pickup_initiated = True
                     active_marker_id = data['id']
+                    detected_marker_ids.add(data['id'])  # Mark this ID as used
                     
                     # Use detected target coordinates based on which plate we're on
                     if plates_completed == 0:
@@ -878,7 +899,15 @@ def main():
         # Send data to Pico at specified interval (only after grid is calibrated)
         current_time = time.time()
         if grid_calibrated and current_time - last_send_time >= SEND_INTERVAL:
-            if marker_data:
+            if pickup_initiated and active_marker_id is not None and blob_row is not None:
+                # During pickup/movement: send BLOB position for real-time LCD update
+                if not test_mode:
+                    success = send_blob_position(ser, active_marker_id, blob_row, blob_col)
+                    pico_status = f"BLOB ({blob_row+1},{blob_col+1})" if success else "BLOB FAILED"
+                else:
+                    pico_status = f"BLOB TEST ({blob_row+1},{blob_col+1})"
+            elif marker_data:
+                # Before pickup: send ArUco marker data
                 if not test_mode:
                     success = send_marker_data(ser, marker_data)
                     pico_status = "SENT" if success else "FAILED"

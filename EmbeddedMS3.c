@@ -25,33 +25,33 @@
 
 // DC Motor Outputs (L298N style: PWM enable + dual direction pins)
 #define MOTOR_A_PWM     15  // Motor A PWM (ENA)
-#define MOTOR_A_IN1     17  // Motor A direction input 1
-#define MOTOR_A_IN2     16  // Motor A direction input 2
-#define MOTOR_B_PWM     13  // Motor B PWM (ENB)
-#define MOTOR_B_IN3     19  // Motor B direction input 3
-#define MOTOR_B_IN4     18  // Motor B direction input 4
+#define MOTOR_A_IN1     13  // Motor A direction input 1
+#define MOTOR_A_IN2     12  // Motor A direction input 2
+#define MOTOR_B_PWM     14  // Motor B PWM (ENB)
+#define MOTOR_B_IN3     11  // Motor B direction input 3
+#define MOTOR_B_IN4     10  // Motor B direction input 4
 
 // Limit Switches (for homing)
-#define LIMIT_X_PIN     22   // X-axis limit switch (emergency stop)
-#define LIMIT_Y_PIN     21   // Y-axis limit switch (emergency stop)
+#define LIMIT_X_PIN     21   // X-axis limit switch (emergency stop)
+#define LIMIT_Y_PIN     20   // Y-axis limit switch (emergency stop)
 
-// Electromagnet H-Bridge
-#define MAGNET_PIN      2   // Electromagnet control (H-bridge enable)
-#define EM_IN1          3   // Electromagnet direction control 1
-#define EM_IN2          4   // Electromagnet direction control 2
+// Electromagnet H-Bridge Control
+#define EM_ENABLE_PIN   2   // H-bridge enable (PWM capable)
+#define EM_IN1_PIN      19  // H-bridge IN1 (polarity control)
+#define EM_IN2_PIN      18   // H-bridge IN2 (polarity control)
 
 // Push Button
-#define BUTTON_PIN      9   // Stage start button (unused)
+#define BUTTON_PIN      7   // Stage start button (unused)
 
 // Buzzer
-#define BUZZER_PIN      10  // Confirmation buzzer
+#define BUZZER_PIN      9  // Confirmation buzzer
 
 // UV LED
-#define UV_LED_PIN      11  // Reward UV LED
+#define UV_LED_PIN      8  // Reward UV LED
 
 // LCD I2C (Uses I2C0)
-#define I2C_SDA_PIN     0   // I2C0 SDA
-#define I2C_SCL_PIN     1   // I2C0 SCL
+#define I2C_SDA_PIN     16   // I2C0 SDA
+#define I2C_SCL_PIN     17   // I2C0 SCL
 #define LCD_ADDR        0x27 // Common I2C LCD address (or 0x3F)
 
 // ============================================================================
@@ -124,10 +124,9 @@ static aruco_plate_t plate_1 = {0};
 static aruco_plate_t plate_2 = {0};
 static uint32_t placement_start_time = 0;
 static bool magnet_active = false;
-static int qr_sequence[4] = {5, 4, 3, 2}; // Example: 5432 -> (5,4) and (3,2)
+static int qr_sequence[4] = {2, 5, 4, 3}; // Format matches camera "5234": {col1, row1, col2, row2} -> (5,2) and (3,4) in 1-indexed
 static int16_t debug_motor_a = 0;
 static int16_t debug_motor_b = 0;
-static uint32_t last_debug_lcd_ms = 0;
 static uint16_t debug_adc_x = 0;
 static uint16_t debug_adc_y = 0;
 static int16_t debug_x_cmd = 0;
@@ -136,9 +135,6 @@ static int16_t debug_y_cmd = 0;
 static float smoothed_x = 0.0f;
 static float smoothed_y = 0.0f;
 static bool smoothing_initialized = false;
-// LCD update throttle: wait at least 5 seconds between camera refreshes
-static const uint32_t LCD_UPDATE_INTERVAL_MS = 5000;
-static uint32_t last_lcd_update_ms = 0;
 
 // ============================================================================
 // LCD I2C FUNCTIONS (16x2 LCD)
@@ -219,27 +215,94 @@ void lcd_printf(int col, int row, const char *format, ...) {
 }
 
 // ----------------------------------------------------------------------------
-// CAMERA FEEDBACK → LCD
+// UNIFIED LCD UPDATE
 // ----------------------------------------------------------------------------
-// Shows latest parsed camera values on the 16x2 LCD.
-static void lcd_show_camera_feedback(void) {
-    // Line 0: Marker ID and grid (display 1-based grid for readability)
-    char line0[17];
-    int id = camera_data.detected_marker.id;
-    int r = camera_data.detected_marker.grid_row;
-    int c = camera_data.detected_marker.grid_col;
-    if (r < 0) r = 0; if (c < 0) c = 0; // basic safety
-    lcd_set_cursor(0, 0);
-    snprintf(line0, sizeof(line0), "ID:%3d R:%d C:%d", id, r + 1, c + 1);
-    lcd_print(line0);
+// Single function to update LCD based on current state
+// Called from main loop with throttling, or forced on state changes
+static uint32_t last_lcd_refresh_ms = 0;
+static const uint32_t LCD_REFRESH_INTERVAL_MS = 100;  // Update at 10Hz for responsive position display
 
-    // Line 1: X/Y (1-based) and age since last update
+// Forward declaration for state machine
+void update_lcd_for_state(void);
+
+static void update_lcd_impl(bool force) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
-    uint32_t age_ms = now - camera_data.last_update_time;
-    char line1[17];
-    lcd_set_cursor(0, 1);
-    snprintf(line1, sizeof(line1), "X:%d Y:%d %4dms", camera_data.current_x + 1, camera_data.current_y + 1, (int)age_ms);
-    lcd_print(line1);
+    
+    // Throttle updates to reduce flicker (unless forced)
+    if (!force && (now - last_lcd_refresh_ms < LCD_REFRESH_INTERVAL_MS)) {
+        return;
+    }
+    last_lcd_refresh_ms = now;
+    
+    lcd_clear();
+    
+    switch (current_state) {
+        case STATE_INIT:
+            lcd_printf(0, 0, "INITIALIZING...");
+            break;
+            
+        case STATE_HOMING:
+            // Homing has its own LCD messages in homing_sequence()
+            break;
+            
+        case STATE_WAIT_PLATE_1:
+            lcd_printf(0, 0, "PLACE ARUCO");
+            lcd_printf(0, 1, "at (1,1)");
+            break;
+            
+        case STATE_PICK_PLATE_1:
+            lcd_printf(0, 0, "ID %d DETECTED", camera_data.detected_marker.id);
+            lcd_printf(0, 1, "T:%d,%d PICK", 
+                      plate_1.target_y + 1, plate_1.target_x + 1);
+            break;
+            
+        case STATE_MOVE_PLATE_1:
+        case STATE_VERIFY_PLATE_1:
+            lcd_printf(0, 0, "T:%d,%d  C:%d,%d", 
+                      plate_1.target_y + 1, plate_1.target_x + 1,
+                      camera_data.current_y + 1, camera_data.current_x + 1);
+            lcd_printf(0, 1, "Plate 1 %s", 
+                      current_state == STATE_MOVE_PLATE_1 ? "Moving" : "Verify");
+            break;
+            
+        case STATE_WAIT_PLATE_2:
+            lcd_printf(0, 0, "ADD ARUCO #2");
+            lcd_printf(0, 1, "at (1,1)");
+            break;
+            
+        case STATE_PICK_PLATE_2:
+            lcd_printf(0, 0, "ID %d DETECTED", camera_data.detected_marker.id);
+            lcd_printf(0, 1, "T:%d,%d PICK", 
+                      plate_2.target_y + 1, plate_2.target_x + 1);
+            break;
+            
+        case STATE_MOVE_PLATE_2:
+        case STATE_VERIFY_PLATE_2:
+            lcd_printf(0, 0, "T:%d,%d  C:%d,%d", 
+                      plate_2.target_y + 1, plate_2.target_x + 1,
+                      camera_data.current_y + 1, camera_data.current_x + 1);
+            lcd_printf(0, 1, "Plate 2 %s", 
+                      current_state == STATE_MOVE_PLATE_2 ? "Moving" : "Verify");
+            break;
+            
+        case STATE_COMPLETE:
+            lcd_printf(0, 0, "** SUCCESS! **");
+            lcd_printf(0, 1, "UV LIGHT ON");
+            break;
+            
+        default:
+            break;
+    }
+}
+
+// Called from state machine on state changes - forces immediate update
+void update_lcd_for_state(void) {
+    update_lcd_impl(true);
+}
+
+// Called from main loop - throttled to 5Hz
+void update_lcd_periodic(void) {
+    update_lcd_impl(false);
 }
 
 // ============================================================================
@@ -372,9 +435,15 @@ static int read_pot_with_deadzone(uint adc_channel) {
         return 0;
     }
 
-    // Normalize to -1..+1 using 1.65V span, then scale to -255..255
+    // Normalize to -1..+1 using 1.65V span
     float norm = (float)centered / (float)mid;
-    float scaled = norm * 255.0f;
+    
+    // Apply quadratic scaling: speed increases with square of distance from center
+    // This gives fine control near center and faster movement at extremes
+    float sign = (norm >= 0) ? 1.0f : -1.0f;
+    float magnitude = fabs(norm);
+    float scaled = sign * magnitude * magnitude * 255.0f;
+    
     if (scaled > 255.0f) scaled = 255.0f;
     if (scaled < -255.0f) scaled = -255.0f;
     return (int)scaled;
@@ -392,25 +461,6 @@ static void update_motors_from_pots_hbot(void) {
     debug_y_cmd = y_cmd;
     
     hbot_drive(x_cmd, y_cmd);
-
-    // Display values for testing
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - last_debug_lcd_ms > 200) { // update ~5 Hz to reduce flicker
-        if (TEST_DISPLAY_ONLY) {
-            // Line 0: Raw ADC values (0-4095)
-            lcd_set_cursor(0, 0);
-            char buf0[17];
-            snprintf(buf0, sizeof(buf0), "X:%4d Y:%4d", debug_adc_x, debug_adc_y);
-            lcd_print(buf0);
-            // Line 1: Computed commands and motor outputs
-            lcd_set_cursor(0, 1);
-            char buf1[17];
-            snprintf(buf1, sizeof(buf1), "A:%+4d B:%+4d", debug_motor_a, debug_motor_b);
-            lcd_print(buf1);
-        }
-        // In normal mode, camera feedback is shown by state machine or handle_serial_line
-        last_debug_lcd_ms = now;
-    }
 }
 
 // Forward declaration
@@ -419,17 +469,17 @@ uint8_t check_limit_switches(void);
 static void hbot_drive(int x_cmd, int y_cmd) {
     // Check which limit switches are active
     uint8_t limits = check_limit_switches();
-    bool x_limit = (limits & 0x01) != 0;  // X limit at left (negative X)
-    bool y_limit = (limits & 0x02) != 0;  // Y limit at top (negative Y)
+    bool x_limit = (limits & 0x01) != 0;  // LIMIT_X_PIN (bit 0) - DOWN limit
+    bool y_limit = (limits & 0x02) != 0;  // LIMIT_Y_PIN (bit 1) - LEFT limit
     
-    // Constrain commands based on active limits
-    // X limit hit: prevent further negative X movement (allow positive X)
-    if (x_limit && x_cmd < 0) {
+    // Constrain commands based on active limits (matching homing sequence behavior)
+    // LIMIT_Y_PIN hit: prevent further LEFT movement (negative X)
+    if (y_limit && x_cmd < 0) {
         x_cmd = 0;
     }
     
-    // Y limit hit: prevent further positive Y movement (allow negative Y to move away)
-    if (y_limit && y_cmd > 0) {
+    // LIMIT_X_PIN hit: prevent further DOWN movement (positive Y)
+    if (x_limit && y_cmd > 0) {
         y_cmd = 0;
     }
     
@@ -540,32 +590,56 @@ bool homing_sequence(void) {
 // ============================================================================
 
 void magnet_init(void) {
-    gpio_init(MAGNET_PIN);
-    gpio_set_dir(MAGNET_PIN, GPIO_OUT);
-    gpio_put(MAGNET_PIN, 0);
+    gpio_init(EM_ENABLE_PIN);
+    gpio_set_dir(EM_ENABLE_PIN, GPIO_OUT);
+    gpio_put(EM_ENABLE_PIN, 0);
     
-    gpio_init(EM_IN1);
-    gpio_set_dir(EM_IN1, GPIO_OUT);
-    gpio_put(EM_IN1, 0);
+    gpio_init(EM_IN1_PIN);
+    gpio_set_dir(EM_IN1_PIN, GPIO_OUT);
+    gpio_put(EM_IN1_PIN, 0);
     
-    gpio_init(EM_IN2);
-    gpio_set_dir(EM_IN2, GPIO_OUT);
-    gpio_put(EM_IN2, 0);
+    gpio_init(EM_IN2_PIN);
+    gpio_set_dir(EM_IN2_PIN, GPIO_OUT);
+    gpio_put(EM_IN2_PIN, 0);
 }
 
 void magnet_set(bool active) {
     if (active) {
-        // Enable with forward polarity: IN1=HIGH, IN2=LOW
-        gpio_put(EM_IN1, 1);
-        gpio_put(EM_IN2, 0);
-        gpio_put(MAGNET_PIN, 1);
+        // Turn on electromagnet with forward polarity
+        gpio_put(EM_IN1_PIN, 1);
+        gpio_put(EM_IN2_PIN, 0);
+        gpio_put(EM_ENABLE_PIN, 1);
     } else {
-        // Reverse polarity to help release: IN1=LOW, IN2=HIGH
-        gpio_put(EM_IN1, 0);
-        gpio_put(EM_IN2, 1);
-        gpio_put(MAGNET_PIN, 1);
+        // Just turn off (no reverse)
+        gpio_put(EM_ENABLE_PIN, 0);
+        gpio_put(EM_IN1_PIN, 0);
+        gpio_put(EM_IN2_PIN, 0);
     }
     magnet_active = active;
+}
+
+void magnet_release_hold(void) {
+    // Reverse polarity and KEEP it running until next pickup
+    // This helps repel the plate and demagnetize
+    gpio_put(EM_IN1_PIN, 0);
+    gpio_put(EM_IN2_PIN, 1);
+    gpio_put(EM_ENABLE_PIN, 1);
+    magnet_active = false;  // Logically released
+    printf("Magnet: Reverse polarity (holding)\n");
+}
+
+void magnet_release_final(void) {
+    // Reverse polarity for 1 second, then turn off completely
+    gpio_put(EM_IN1_PIN, 0);
+    gpio_put(EM_IN2_PIN, 1);
+    gpio_put(EM_ENABLE_PIN, 1);
+    printf("Magnet: Reverse polarity (1 second)\n");
+    sleep_ms(1000);  // 1 second reverse pulse
+    gpio_put(EM_ENABLE_PIN, 0);
+    gpio_put(EM_IN1_PIN, 0);
+    gpio_put(EM_IN2_PIN, 0);
+    magnet_active = false;
+    printf("Magnet: OFF\n");
 }
 
 void buzzer_init(void) {
@@ -622,9 +696,6 @@ bool button_check(void) {
 // USB SERIAL PARSING (Camera → Pico)
 // ============================================================================
 
-// Forward declaration
-void update_lcd_for_state(void);
-
 static char serial_buffer[128];
 static uint8_t serial_idx = 0;
 
@@ -652,10 +723,10 @@ void handle_serial_line(const char *line) {
     // Check for RELEASE command
     if (strncmp(line, "RELEASE", 7) == 0) {
         printf("SER RX -> RELEASE command received\n");
-        magnet_set(false);  // Turn off electromagnet
         
         // Transition to next state based on current state
         if (current_state == STATE_VERIFY_PLATE_1 || current_state == STATE_MOVE_PLATE_1) {
+            magnet_release_hold();  // Reverse polarity, keep running until next pickup
             plate_1.placed = true;
             current_state = STATE_WAIT_PLATE_2;
             camera_data.marker_detected = false;  // Reset for next marker
@@ -665,6 +736,7 @@ void handle_serial_line(const char *line) {
             update_lcd_for_state();
             printf("Transitioning to WAIT_PLATE_2\n");
         } else if (current_state == STATE_VERIFY_PLATE_2 || current_state == STATE_MOVE_PLATE_2) {
+            magnet_release_final();  // Reverse for 1 second, then off
             plate_2.placed = true;
             current_state = STATE_COMPLETE;
             camera_data.marker_detected = false;
@@ -689,13 +761,7 @@ void handle_serial_line(const char *line) {
         camera_data.current_y = row;
         camera_data.last_update_time = to_ms_since_boot(get_absolute_time());
         printf("SER RX -> ID:%d ROW:%d COL:%d\n", id, row, col);
-        
-        // Show on LCD, throttled to every 5 seconds to avoid flicker
-        uint32_t now = camera_data.last_update_time;
-        if (now - last_lcd_update_ms >= LCD_UPDATE_INTERVAL_MS) {
-            lcd_show_camera_feedback();
-            last_lcd_update_ms = now;
-        }
+        // LCD update handled by unified update_lcd() in main loop
     }
 }
 
@@ -725,85 +791,25 @@ void poll_serial(void) {
 // ============================================================================
 
 void init_targets_from_qr(void) {
-    // QR sequence: [5, 4, 3, 2] means:
-    // Plate 1 target: (5, 4) -> grid indices (4, 3) in 0-based
-    // Plate 2 target: (3, 2) -> grid indices (2, 1) in 0-based
+    // QR sequence format: [col1, row1, col2, row2] (1-indexed)
+    // Example "5234": col1=2, row1=5, col2=4, row2=3
+    // Gives: Plate 1 -> (5,2) and Plate 2 -> (3,4) in 1-indexed
     
-    plate_1.target_x = qr_sequence[0] - 1; // Convert to 0-based
-    plate_1.target_y = qr_sequence[1] - 1;
+    plate_1.target_x = qr_sequence[0] - 1; // col (X) - convert to 0-based
+    plate_1.target_y = qr_sequence[1] - 1; // row (Y) - convert to 0-based
     plate_1.placed = false;
     
-    plate_2.target_x = qr_sequence[2] - 1;
-    plate_2.target_y = qr_sequence[3] - 1;
+    plate_2.target_x = qr_sequence[2] - 1; // col (X) - convert to 0-based
+    plate_2.target_y = qr_sequence[3] - 1; // row (Y) - convert to 0-based
     plate_2.placed = false;
     
-    printf("Target 1: (%d,%d)\n", plate_1.target_x + 1, plate_1.target_y + 1);
-    printf("Target 2: (%d,%d)\n", plate_2.target_x + 1, plate_2.target_y + 1);
+    printf("Target 1: (%d,%d)\n", plate_1.target_y + 1, plate_1.target_x + 1); // Display as (row,col)
+    printf("Target 2: (%d,%d)\n", plate_2.target_y + 1, plate_2.target_x + 1); // Display as (row,col)
 }
 
 // ============================================================================
 // STATE MACHINE LOGIC
 // ============================================================================
-
-void update_lcd_for_state(void) {
-    lcd_clear();
-    
-    switch (current_state) {
-        case STATE_WAIT_PLATE_1:
-            lcd_printf(0, 0, "PLACE ARUCO");
-            lcd_printf(0, 1, "at (1,1)");
-            break;
-            
-        case STATE_PICK_PLATE_1:
-            lcd_printf(0, 0, "ID %d DETECTED", camera_data.detected_marker.id);
-            lcd_printf(0, 1, "T:(%d,%d) PICK", 
-                      plate_1.target_x + 1, plate_1.target_y + 1);
-            break;
-            
-        case STATE_MOVE_PLATE_1:
-            lcd_printf(0, 0, "T:(%d,%d) C:(%d,%d)", 
-                      plate_1.target_x + 1, plate_1.target_y + 1,
-                      camera_data.current_x + 1, camera_data.current_y + 1);
-            lcd_printf(0, 1, "Use Pots to Move");
-            break;
-            
-        case STATE_VERIFY_PLATE_1:
-            lcd_printf(0, 0, "VERIFYING...");
-            lcd_printf(0, 1, "Hold position");
-            break;
-            
-        case STATE_WAIT_PLATE_2:
-            lcd_printf(0, 0, "ADD ARUCO #2");
-            lcd_printf(0, 1, "at (1,1)");
-            break;
-            
-        case STATE_PICK_PLATE_2:
-            lcd_printf(0, 0, "ID %d DETECTED", camera_data.detected_marker.id);
-            lcd_printf(0, 1, "T:(%d,%d) PICK", 
-                      plate_2.target_x + 1, plate_2.target_y + 1);
-            break;
-            
-        case STATE_MOVE_PLATE_2:
-            lcd_printf(0, 0, "T:(%d,%d) C:(%d,%d)", 
-                      plate_2.target_x + 1, plate_2.target_y + 1,
-                      camera_data.current_x + 1, camera_data.current_y + 1);
-            lcd_printf(0, 1, "Use Pots to Move");
-            break;
-            
-        case STATE_VERIFY_PLATE_2:
-            lcd_printf(0, 0, "VERIFYING...");
-            lcd_printf(0, 1, "Hold position");
-            break;
-            
-        case STATE_COMPLETE:
-            lcd_printf(0, 0, "** SUCCESS! **");
-            lcd_printf(0, 1, "UV LIGHT ON");
-            break;
-            
-        default:
-            break;
-    }
-}
 
 bool check_target_reached(int target_x, int target_y) {
     return (camera_data.current_x == target_x && 
@@ -867,11 +873,6 @@ void state_machine_update(void) {
         case STATE_MOVE_PLATE_1:
             update_motors_from_pots_hbot();
             
-            // Update LCD with current position
-            if (current_time % 200 < 10) { // Update every ~200ms
-                update_lcd_for_state();
-            }
-            
             // Check if target reached
             if (check_target_reached(plate_1.target_x, plate_1.target_y)) {
                 if (placement_start_time == 0) {
@@ -892,7 +893,7 @@ void state_machine_update(void) {
                 update_lcd_for_state();
             } else if (current_time - placement_start_time >= PLACEMENT_TIME) {
                 // Successfully held position for 5 seconds
-                magnet_set(false);
+                magnet_release_hold();  // Reverse polarity, keep running
                 motors_stop();
                 buzzer_beep(500);
                 plate_1.placed = true;
@@ -925,10 +926,6 @@ void state_machine_update(void) {
         case STATE_MOVE_PLATE_2:
             update_motors_from_pots_hbot();
             
-            if (current_time % 200 < 10) {
-                update_lcd_for_state();
-            }
-            
             if (check_target_reached(plate_2.target_x, plate_2.target_y)) {
                 if (placement_start_time == 0) {
                     placement_start_time = current_time;
@@ -946,7 +943,7 @@ void state_machine_update(void) {
                 current_state = STATE_MOVE_PLATE_2;
                 update_lcd_for_state();
             } else if (current_time - placement_start_time >= PLACEMENT_TIME) {
-                magnet_set(false);
+                magnet_release_final();  // Reverse for 1 second, then off
                 motors_stop();
                 buzzer_beep(500);
                 plate_2.placed = true;
@@ -1070,6 +1067,23 @@ int main() {
         
         while (true) {
             update_motors_from_pots_hbot();
+            
+            // Display test values at 5Hz
+            static uint32_t last_test_lcd = 0;
+            uint32_t now = to_ms_since_boot(get_absolute_time());
+            if (now - last_test_lcd > 200) {
+                lcd_clear();
+                lcd_set_cursor(0, 0);
+                char buf0[17];
+                snprintf(buf0, sizeof(buf0), "X:%4d Y:%4d", debug_adc_x, debug_adc_y);
+                lcd_print(buf0);
+                lcd_set_cursor(0, 1);
+                char buf1[17];
+                snprintf(buf1, sizeof(buf1), "A:%+4d B:%+4d", debug_motor_a, debug_motor_b);
+                lcd_print(buf1);
+                last_test_lcd = now;
+            }
+            
             sleep_ms(50); // ~20Hz update rate
         }
     } else {
@@ -1079,6 +1093,7 @@ int main() {
         while (true) {
             poll_serial();
             state_machine_update();
+            update_lcd_periodic();  // Single place for all LCD updates
             sleep_ms(20); // 50Hz update rate for smoother control
         }
     }
