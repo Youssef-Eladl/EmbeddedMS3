@@ -135,6 +135,7 @@ static int16_t debug_y_cmd = 0;
 static float smoothed_x = 0.0f;
 static float smoothed_y = 0.0f;
 static bool smoothing_initialized = false;
+static bool waiting_for_confirmation = false;
 
 // ============================================================================
 // LCD I2C FUNCTIONS (16x2 LCD)
@@ -246,8 +247,13 @@ static void update_lcd_impl(bool force) {
             break;
             
         case STATE_WAIT_PLATE_1:
-            lcd_printf(0, 0, "PLACE ARUCO");
-            lcd_printf(0, 1, "at (1,1)");
+            if (waiting_for_confirmation) {
+                lcd_printf(0, 0, "ARUCO DETECTED");
+                lcd_printf(0, 1, "Press button");
+            } else {
+                lcd_printf(0, 0, "PLACE ARUCO");
+                lcd_printf(0, 1, "at (1,1)");
+            }
             break;
             
         case STATE_PICK_PLATE_1:
@@ -266,8 +272,13 @@ static void update_lcd_impl(bool force) {
             break;
             
         case STATE_WAIT_PLATE_2:
-            lcd_printf(0, 0, "ADD ARUCO #2");
-            lcd_printf(0, 1, "at (1,1)");
+            if (waiting_for_confirmation) {
+                lcd_printf(0, 0, "ARUCO DETECTED");
+                lcd_printf(0, 1, "Press button");
+            } else {
+                lcd_printf(0, 0, "ADD ARUCO #2");
+                lcd_printf(0, 1, "at (1,1)");
+            }
             break;
             
         case STATE_PICK_PLATE_2:
@@ -837,29 +848,44 @@ void state_machine_update(void) {
             break;
             
         case STATE_WAIT_PLATE_1:
-            // Auto-proceed when marker detected at position (1,1)
+            // Two-step process: detect marker, then wait for button confirmation
             if (camera_data.marker_detected && 
                 (camera_data.detected_marker.id == 1 || 
                  camera_data.detected_marker.id == 2) &&
                 camera_data.detected_marker.grid_row == 0 &&
                 camera_data.detected_marker.grid_col == 0) {
-                // Marker confirmed at (1,1) - proceed with pickup
-                // Determine which plate was detected
-                if (camera_data.detected_marker.id == 1) {
-                    // ID 1 goes to target 1
-                } else {
-                    // ID 2 goes to target 2 - swap targets
-                    int temp_x = plate_1.target_x;
-                    int temp_y = plate_1.target_y;
-                    plate_1.target_x = plate_2.target_x;
-                    plate_1.target_y = plate_2.target_y;
-                    plate_2.target_x = temp_x;
-                    plate_2.target_y = temp_y;
+                
+                if (!waiting_for_confirmation) {
+                    // First time detecting marker - set flag and update LCD
+                    waiting_for_confirmation = true;
+                    // Determine which plate was detected
+                    if (camera_data.detected_marker.id == 1) {
+                        // ID 1 goes to target 1
+                    } else {
+                        // ID 2 goes to target 2 - swap targets
+                        int temp_x = plate_1.target_x;
+                        int temp_y = plate_1.target_y;
+                        plate_1.target_x = plate_2.target_x;
+                        plate_1.target_y = plate_2.target_y;
+                        plate_2.target_x = temp_x;
+                        plate_2.target_y = temp_y;
+                    }
+                    update_lcd_for_state();
+                    buzzer_beep(100);  // Beep to indicate detection
+                } else if (button_check()) {
+                    // Button pressed - proceed with pickup
+                    waiting_for_confirmation = false;
+                    current_state = STATE_PICK_PLATE_1;
+                    update_lcd_for_state();
+                    magnet_set(true);  // Turn on magnet after button confirmation
+                    buzzer_beep(200);  // Different beep for confirmation
                 }
-                current_state = STATE_PICK_PLATE_1;
-                update_lcd_for_state();
-                magnet_set(true);  // Turn on magnet only after confirming (1,1)
-                buzzer_beep(100);
+            } else {
+                // Marker not detected or moved - reset confirmation flag
+                if (waiting_for_confirmation) {
+                    waiting_for_confirmation = false;
+                    update_lcd_for_state();
+                }
             }
             break;
             
@@ -905,14 +931,30 @@ void state_machine_update(void) {
             break;
             
         case STATE_WAIT_PLATE_2:
-            // Auto-proceed when marker detected at position (1,1)
+            // Two-step process: detect marker, then wait for button confirmation
             if (camera_data.marker_detected &&
                 camera_data.detected_marker.grid_row == 0 &&
                 camera_data.detected_marker.grid_col == 0) {
-                current_state = STATE_PICK_PLATE_2;
-                update_lcd_for_state();
-                magnet_set(true);  // Turn on magnet only after confirming (1,1)
-                buzzer_beep(100);
+                
+                if (!waiting_for_confirmation) {
+                    // First time detecting marker - set flag and update LCD
+                    waiting_for_confirmation = true;
+                    update_lcd_for_state();
+                    buzzer_beep(100);  // Beep to indicate detection
+                } else if (button_check()) {
+                    // Button pressed - proceed with pickup
+                    waiting_for_confirmation = false;
+                    current_state = STATE_PICK_PLATE_2;
+                    update_lcd_for_state();
+                    magnet_set(true);  // Turn on magnet after button confirmation
+                    buzzer_beep(200);  // Different beep for confirmation
+                }
+            } else {
+                // Marker not detected or moved - reset confirmation flag
+                if (waiting_for_confirmation) {
+                    waiting_for_confirmation = false;
+                    update_lcd_for_state();
+                }
             }
             break;
             
