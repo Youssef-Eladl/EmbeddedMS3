@@ -41,7 +41,7 @@
 #define EM_IN2_PIN      18   // H-bridge IN2 (polarity control)
 
 // Push Button
-#define BUTTON_PIN      7   // Stage start button (unused)
+#define BUTTON_PIN      6   // Stage start button (unused)
 
 // Buzzer
 #define BUZZER_PIN      9  // Confirmation buzzer
